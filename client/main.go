@@ -1,0 +1,732 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/exec"
+	"os/signal"
+	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/pekhightvpn/wireguard"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+)
+
+var (
+	serverEndpoint = flag.String("server", "120.79.187.148:23456", "服务器地址")
+	tunName        = flag.String("tun", "wgc0", "TUN设备名称") // 使用不同的设备名称
+	configFile     = flag.String("config", "", "WireGuard配置文件路径")
+	serverPubKey   = flag.String("server-pubkey", "", "服务器公钥")
+	privateKey     = flag.String("private-key", "", "客户端私钥")
+	clientIP       = flag.String("ip", "10.9.0.2/24", "客户端IP地址") // 使用不同的IP地址范围
+	listenPort     = flag.Int("listen-port", 51821, "客户端监听端口")   // 使用不同的监听端口
+	useAmnezia     = flag.Bool("amnezia", false, "是否使用AmneziaWG修改")
+)
+
+func main() {
+	flag.Parse()
+
+	// 设置日志输出格式
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	// 如果是Windows系统，设置控制台编码为UTF-8
+	if runtime.GOOS == "windows" {
+		// 设置控制台代码页为UTF-8
+		cmd := exec.Command("chcp", "65001")
+		cmd.Run()
+
+		// 检查并清理孤立的适配器
+		cleanupOrphanedAdapters()
+
+		// 清理可能冲突的网络资源
+		cleanupNetworkResources()
+	}
+
+	log.Printf("启动WireGuard VPN客户端...")
+
+	var config *wireguard.Config
+	var err error
+
+	// 如果提供了配置文件，从文件加载配置
+	if *configFile != "" {
+		config, err = loadConfigFromFile(*configFile)
+		if err != nil {
+			log.Fatalf("加载配置文件失败: %v", err)
+		}
+	} else if *serverPubKey != "" && *privateKey != "" {
+		// 如果提供了服务器公钥和客户端私钥，创建配置
+		config, err = createConfigFromKeys(*serverPubKey, *privateKey, *serverEndpoint, *clientIP)
+		if err != nil {
+			log.Fatalf("创建配置失败: %v", err)
+		}
+	} else {
+		// 否则，生成新的配置
+		config, err = generateNewConfig(*serverEndpoint, *clientIP)
+		if err != nil {
+			log.Fatalf("生成配置失败: %v", err)
+		}
+	}
+
+	// 设置客户端监听端口
+	config.ListenPort = *listenPort
+	log.Printf("客户端监听端口: %d", *listenPort)
+
+	// 如果使用AmneziaWG，应用特定修改
+	if *useAmnezia {
+		wireguard.AmneziaWGModify(config)
+		log.Printf("已应用AmneziaWG特定修改")
+	}
+
+	// 创建WireGuard设备
+	wgDevice, err := wireguard.NewWireGuardDevice(config, false)
+	if err != nil {
+		log.Fatalf("创建WireGuard设备失败: %v", err)
+	}
+	defer wgDevice.Close()
+
+	// 解析IP地址和子网掩码
+	ip, ipNet, err := net.ParseCIDR(*clientIP)
+	if err != nil {
+		log.Fatalf("无效的IP地址: %s, %v", *clientIP, err)
+	}
+
+	// 配置TUN设备IP地址
+	err = configureTunIP(wgDevice.TunName, ip, ipNet)
+	if err != nil {
+		log.Fatalf("配置TUN设备IP地址失败: %v", err)
+	}
+
+	// 添加路由
+	// 注意：我们只需要路由网络，不需要服务器IP
+	err = addRoute(config.AllowedIPs[0].String(), wgDevice.TunName)
+	if err != nil {
+		log.Printf("添加路由失败: %v", err)
+	}
+
+	log.Printf("WireGuard客户端已启动")
+	log.Printf("服务器: %s", config.Endpoint)
+	log.Printf("服务器公钥: %s", config.PublicKey.String())
+	log.Printf("客户端公钥: %s", wireguard.GeneratePublicKey(config.PrivateKey).String())
+	log.Printf("TUN设备: %s, IP: %s", wgDevice.TunName, *clientIP)
+
+	// 等待信号
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	<-sigCh
+	log.Printf("正在关闭WireGuard客户端...")
+
+	// 清理资源
+	log.Printf("正在关闭WireGuard设备...")
+	wgDevice.Close()
+
+	// 如果需要，可以清理路由
+	if runtime.GOOS == "windows" {
+		// 在Windows上清理路由
+		_, ipNet, _ := net.ParseCIDR(config.AllowedIPs[0].String())
+		ip := ipNet.IP.String()
+		mask := net.IP(ipNet.Mask).String()
+		cmd := fmt.Sprintf("cmd.exe /c \"route delete %s mask %s\"", ip, mask)
+		_, _ = runCommand(cmd)
+
+		// 等待一下，确保资源正确释放
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// loadConfigFromFile 从文件加载WireGuard配置
+func loadConfigFromFile(filePath string) (*wireguard.Config, error) {
+	// 读取配置文件
+	_, err := os.ReadFile(filePath) // 我们先检查文件是否存在
+	if err != nil {
+		return nil, fmt.Errorf("读取配置文件失败: %v", err)
+	}
+
+	// 解析配置文件
+	// 这里应该实现解析WireGuard配置文件的逻辑
+	// 由于配置文件格式较为复杂，这里只是一个简化的实现
+
+	// 假设我们已经解析出了私钥、服务器公钥、端点和允许的IP
+	privateKeyStr := "your_private_key"    // 从配置文件中提取
+	serverPubKeyStr := "server_public_key" // 从配置文件中提取
+	endpoint := "server_endpoint"          // 从配置文件中提取
+	allowedIPStr := "10.8.0.0/24"          // 从配置文件中提取
+
+	// 解析密钥
+	privateKey, err := wireguard.ParseKey(privateKeyStr)
+	if err != nil {
+		return nil, fmt.Errorf("解析私钥失败: %v", err)
+	}
+
+	serverPubKey, err := wireguard.ParseKey(serverPubKeyStr)
+	if err != nil {
+		return nil, fmt.Errorf("解析服务器公钥失败: %v", err)
+	}
+
+	// 解析允许的IP
+	_, allowedIP, err := net.ParseCIDR(allowedIPStr)
+	if err != nil {
+		return nil, fmt.Errorf("解析允许的IP失败: %v", err)
+	}
+
+	// 创建配置
+	config := &wireguard.Config{
+		PrivateKey: privateKey,
+		PublicKey:  serverPubKey,
+		Endpoint:   endpoint,
+		AllowedIPs: []net.IPNet{*allowedIP},
+	}
+
+	return config, nil
+}
+
+// createConfigFromKeys 从密钥创建WireGuard配置
+func createConfigFromKeys(serverPubKeyStr, privateKeyStr, endpoint, clientIPStr string) (*wireguard.Config, error) {
+	// 解析密钥
+	privateKey, err := wireguard.ParseKey(privateKeyStr)
+	if err != nil {
+		return nil, fmt.Errorf("解析私钥失败: %v", err)
+	}
+
+	serverPubKey, err := wireguard.ParseKey(serverPubKeyStr)
+	if err != nil {
+		return nil, fmt.Errorf("解析服务器公钥失败: %v", err)
+	}
+
+	// 解析允许的IP - 使用与服务端不同的网段
+	_, allowedIP, err := net.ParseCIDR("10.9.0.0/24")
+	if err != nil {
+		return nil, fmt.Errorf("解析允许的IP失败: %v", err)
+	}
+
+	// 创建配置
+	config := &wireguard.Config{
+		PrivateKey: privateKey,
+		PublicKey:  serverPubKey,
+		Endpoint:   endpoint,
+		AllowedIPs: []net.IPNet{*allowedIP},
+	}
+
+	return config, nil
+}
+
+// generateNewConfig 生成新的WireGuard配置
+func generateNewConfig(endpoint, clientIPStr string) (*wireguard.Config, error) {
+	// 生成客户端私钥
+	privateKey, err := wireguard.GeneratePrivateKey()
+	if err != nil {
+		return nil, fmt.Errorf("生成私钥失败: %v", err)
+	}
+
+	// 解析允许的IP - 使用与服务端不同的网段
+	_, allowedIP, err := net.ParseCIDR("10.9.0.0/24")
+	if err != nil {
+		return nil, fmt.Errorf("解析允许的IP失败: %v", err)
+	}
+
+	// 尝试从服务器获取公钥
+	log.Printf("尝试从服务器获取公钥...")
+	log.Printf("连接到服务器: %s", endpoint)
+	serverPublicKey, err := getServerPublicKey(endpoint)
+	if err != nil {
+		log.Printf("无法从服务器获取公钥: %v", err)
+		log.Printf("使用占位符公钥，连接可能会失败")
+
+		// 尝试使用默认公钥
+		if *serverPubKey != "" {
+			log.Printf("尝试使用命令行提供的服务器公钥: %s", *serverPubKey)
+			parsedKey, parseErr := wireguard.ParseKey(*serverPubKey)
+			if parseErr == nil {
+				serverPublicKey = parsedKey
+				log.Printf("成功使用命令行提供的服务器公钥")
+			} else {
+				log.Printf("解析命令行提供的服务器公钥失败: %v", parseErr)
+				// 使用占位符公钥
+				placeholderKey, _ := wireguard.ParseKey("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+				serverPublicKey = placeholderKey
+			}
+		} else {
+			// 使用占位符公钥
+			placeholderKey, _ := wireguard.ParseKey("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+			serverPublicKey = placeholderKey
+			log.Printf("请使用 -server-pubkey 参数指定服务器公钥")
+		}
+	} else {
+		log.Printf("成功从服务器获取公钥: %s", serverPublicKey.String())
+	}
+
+	// 创建配置
+	config := &wireguard.Config{
+		PrivateKey:          privateKey,
+		PublicKey:           serverPublicKey, // 设置服务器公钥
+		Endpoint:            endpoint,
+		AllowedIPs:          []net.IPNet{*allowedIP},
+		PersistentKeepalive: 25, // 每25秒发送一次keepalive包
+	}
+
+	// 打印客户端公钥，用于添加到服务器
+	publicKey := wireguard.GeneratePublicKey(privateKey)
+	log.Printf("生成的客户端公钥: %s", publicKey.String())
+	log.Printf("请将此公钥添加到服务器配置中")
+
+	return config, nil
+}
+
+// configureTunIP 配置TUN设备IP地址
+func configureTunIP(tunName string, ip net.IP, ipNet *net.IPNet) error {
+	// 根据操作系统配置IP地址
+	switch runtime.GOOS {
+	case "linux":
+		// 使用ip命令配置
+		cmd := fmt.Sprintf("ip addr add %s/%d dev %s", ip.String(), maskBits(ipNet.Mask), tunName)
+		_, err := runCommand(cmd)
+		if err != nil {
+			return fmt.Errorf("配置IP地址失败: %v", err)
+		}
+
+		// 启用设备
+		cmd = fmt.Sprintf("ip link set dev %s up", tunName)
+		_, err = runCommand(cmd)
+		if err != nil {
+			return fmt.Errorf("启用设备失败: %v", err)
+		}
+		return nil
+
+	case "darwin": // macOS
+		// 使用ifconfig命令配置
+		maskStr := net.IP(ipNet.Mask).String()
+		cmd := fmt.Sprintf("ifconfig %s inet %s %s netmask %s up", tunName, ip.String(), ip.String(), maskStr)
+		_, err := runCommand(cmd)
+		if err != nil {
+			return fmt.Errorf("配置IP地址失败: %v", err)
+		}
+		return nil
+
+	case "windows":
+		// 使用PowerShell命令配置
+		// 注意：在Windows上我们使用PowerShell命令，不需要掩码
+
+		// 在Windows上，有时需要等待设备准备就绪
+		time.Sleep(2 * time.Second)
+
+		// 获取接口索引
+		cmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceDescription -like '*TAP-Windows*' -or $_.InterfaceAlias -eq '%s'} | Select-Object -ExpandProperty ifIndex", tunName)
+		output, err := runCommand(cmd)
+		if err != nil {
+			return fmt.Errorf("获取网络接口失败: %v", err)
+		}
+
+		// 解析接口索引
+		ifIndex := strings.TrimSpace(output)
+		if ifIndex == "" {
+			return fmt.Errorf("无法找到WireGuard网络接口")
+		}
+
+		// 先检查是否有冲突的IP地址 - 使用cmd.exe执行ipconfig命令
+		checkCmd := "cmd.exe /c \"ipconfig /all\""
+		output, _ = runCommand(checkCmd)
+		if strings.Contains(output, ip.String()) {
+			log.Printf("发现冲突的IP地址: %s，尝试移除", ip.String())
+			// 使用netsh命令删除IP地址
+			removeCmd := fmt.Sprintf("cmd.exe /c \"netsh interface ip delete address \\\"%s\\\" %s\"", tunName, ip.String())
+			_, _ = runCommand(removeCmd)
+			// 等待一下，确保IP地址已经被清理
+			time.Sleep(1 * time.Second)
+		}
+
+		// 配置IP地址 - 使用单行命令避免换行问题
+		cmd = fmt.Sprintf("New-NetIPAddress -InterfaceIndex %s -IPAddress %s -PrefixLength %d -Confirm:$false", ifIndex, ip.String(), maskBits(ipNet.Mask))
+		_, err = runCommand(cmd)
+		if err != nil {
+			// 如果失败，可能是因为IP已经存在，尝试移除并重新添加
+			removeCmd := fmt.Sprintf("Remove-NetIPAddress -InterfaceIndex %s -Confirm:$false -ErrorAction SilentlyContinue", ifIndex)
+			_, _ = runCommand(removeCmd)
+
+			// 等待一下，确保IP地址已经被清理
+			time.Sleep(1 * time.Second)
+
+			// 尝试使用netsh命令配置IP地址
+			netshCmd := fmt.Sprintf("cmd.exe /c \"netsh interface ip add address \\\"%s\\\" %s %s\"", tunName, ip.String(), net.IP(ipNet.Mask).String())
+			_, err = runCommand(netshCmd)
+			if err != nil {
+				return fmt.Errorf("配置IP地址失败: %v", err)
+			}
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
+
+// runCommand 运行shell命令
+func runCommand(cmd string) (string, error) {
+	var command *exec.Cmd
+
+	// 检查是否是静默命令
+	isSilentCommand := strings.Contains(cmd, "SilentlyContinue") ||
+		strings.Contains(cmd, "Remove-NetAdapter") ||
+		strings.Contains(cmd, "route delete") ||
+		strings.Contains(cmd, "Remove-NetIPAddress") ||
+		strings.Contains(cmd, "Remove-NetRoute")
+
+	// 仅在非静默命令时输出日志
+	if !isSilentCommand {
+		log.Printf("执行命令: %s", cmd)
+	}
+
+	if runtime.GOOS == "windows" {
+		command = exec.Command("powershell", "-Command", cmd)
+	} else {
+		command = exec.Command("sh", "-c", cmd)
+	}
+
+	output, err := command.CombinedOutput()
+	if err != nil {
+		// 仅在非静默命令失败时输出错误日志
+		if !isSilentCommand {
+			log.Printf("命令执行失败: %v, 输出: %s", err, string(output))
+		}
+		return string(output), err
+	}
+
+	return string(output), nil
+}
+
+// maskBits 计算子网掩码的位数
+func maskBits(mask net.IPMask) int {
+	bits, _ := mask.Size()
+	return bits
+}
+
+// addRoute 添加路由
+func addRoute(network, tunName string) error {
+	// 根据操作系统添加路由
+	switch runtime.GOOS {
+	case "linux":
+		cmd := fmt.Sprintf("ip route add %s dev %s", network, tunName)
+		_, err := runCommand(cmd)
+		if err != nil {
+			return fmt.Errorf("添加路由失败: %v", err)
+		}
+		return nil
+
+	case "darwin": // macOS
+		cmd := fmt.Sprintf("route add -net %s -interface %s", network, tunName)
+		_, err := runCommand(cmd)
+		if err != nil {
+			return fmt.Errorf("添加路由失败: %v", err)
+		}
+		return nil
+
+	case "windows":
+		// 解析网络和掩码
+		_, ipNet, err := net.ParseCIDR(network)
+		if err != nil {
+			return fmt.Errorf("解析网络失败: %v", err)
+		}
+
+		ip := ipNet.IP.String()
+		mask := net.IP(ipNet.Mask).String()
+
+		// 获取TUN设备的IP地址作为网关
+		tunIP, err := getTunIP(tunName)
+		if err != nil {
+			// 如果无法获取TUN设备IP，尝试使用默认网关
+			log.Printf("无法获取TUN设备IP，将使用默认网关: %v", err)
+			cmd := fmt.Sprintf("route add %s mask %s 0.0.0.0 metric 1", ip, mask)
+			_, err = runCommand(cmd)
+			if err != nil {
+				return fmt.Errorf("添加路由失败: %v", err)
+			}
+		} else {
+			// 先检查是否已经存在路由
+			checkCmd := fmt.Sprintf("route print %s", ip)
+			output, _ := runCommand(checkCmd)
+			if strings.Contains(output, ip) {
+				log.Printf("发现已存在的路由，尝试删除: %s", ip)
+				deleteCmd := fmt.Sprintf("route delete %s mask %s", ip, mask)
+				_, _ = runCommand(deleteCmd)
+				// 等待一下，确保路由已经被清理
+				time.Sleep(1 * time.Second)
+			}
+
+			// 使用TUN设备IP作为网关
+			// 在PowerShell中使用cmd.exe执行route命令
+			cmd := fmt.Sprintf("cmd.exe /c \"route add %s mask %s %s metric 1\"", ip, mask, tunIP)
+			_, err = runCommand(cmd)
+			if err != nil {
+				// 如果失败，再次尝试删除路由并重新添加
+				deleteCmd := fmt.Sprintf("cmd.exe /c \"route delete %s mask %s\"", ip, mask)
+				_, _ = runCommand(deleteCmd)
+				time.Sleep(1 * time.Second)
+
+				// 重新添加路由
+				_, err = runCommand(cmd)
+				if err != nil {
+					return fmt.Errorf("添加路由失败: %v", err)
+				}
+			}
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
+
+// cleanupNetworkResources 清理可能冲突的网络资源
+func cleanupNetworkResources() {
+	// 清理可能冲突的IP地址
+	ip, ipNet, err := net.ParseCIDR(*clientIP)
+	if err == nil {
+		// 在Windows上，我们使用PowerShell命令来清理IP地址
+		// 这样可以避免中文和特殊字符的问题
+		if runtime.GOOS == "windows" {
+			// 获取所有网络接口的索引
+			cmd := "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object -ExpandProperty ifIndex"
+			output, _ := runCommand(cmd)
+			if output != "" {
+				// 遍历所有网络接口索引，尝试删除IP地址
+				indices := strings.Split(strings.TrimSpace(output), "\n")
+				for _, index := range indices {
+					index = strings.TrimSpace(index)
+					if index != "" {
+						// 使用PowerShell命令删除IP地址
+						deleteCmd := fmt.Sprintf("Get-NetIPAddress -InterfaceIndex %s -IPAddress %s -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue", index, ip.String())
+						_, _ = runCommand(deleteCmd)
+					}
+				}
+			}
+
+			// 清理路由 - 使用PowerShell命令
+			cmd = fmt.Sprintf("Remove-NetRoute -DestinationPrefix %s -Confirm:$false -ErrorAction SilentlyContinue", ipNet.String())
+			_, _ = runCommand(cmd)
+
+			// 备用方法：使用route命令
+			cmd = fmt.Sprintf("route delete %s", ipNet.IP.String())
+			_, _ = runCommand(cmd)
+		} else {
+			// 在非Windows系统上使用原来的方法
+			if runtime.GOOS == "linux" {
+				cmd := fmt.Sprintf("ip addr del %s dev $(ip route | grep %s | awk '{print $3}')", ip.String(), ipNet.IP.String())
+				_, _ = runCommand(cmd)
+
+				cmd = fmt.Sprintf("ip route del %s", ipNet.String())
+				_, _ = runCommand(cmd)
+			} else if runtime.GOOS == "darwin" {
+				cmd := fmt.Sprintf("ifconfig $(route -n get %s | grep interface | awk '{print $2}') inet %s delete", ipNet.IP.String(), ip.String())
+				_, _ = runCommand(cmd)
+
+				cmd = fmt.Sprintf("route delete -net %s", ipNet.String())
+				_, _ = runCommand(cmd)
+			}
+		}
+	}
+
+	// 等待一下，确保资源已经被清理
+	time.Sleep(1 * time.Second)
+}
+
+// cleanupOrphanedAdapters 清理孤立的WireGuard适配器
+func cleanupOrphanedAdapters() {
+	// 查找客户端的WireGuard适配器，避免清理服务端的适配器
+	cmd := "Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -and $_.Name -like 'WireGuardClient*'} | Select-Object -ExpandProperty Name"
+	output, err := runCommand(cmd)
+	if err != nil {
+		// 如果查询失败，直接返回
+		return
+	}
+
+	// 如果有适配器，尝试清理
+	adapterNames := strings.Split(strings.TrimSpace(output), "\n")
+	for _, name := range adapterNames {
+		name = strings.TrimSpace(name)
+		if name != "" && name != "WireGuardServer" { // 确保不清理服务端适配器
+			log.Printf("检测到孤立的WireGuard客户端适配器: %s，尝试清理", name)
+
+			// 尝试移除适配器，但不显示错误
+			removeCmd := fmt.Sprintf("Remove-NetAdapter -Name \"%s\" -Confirm:$false -ErrorAction SilentlyContinue", name)
+			_, _ = runCommand(removeCmd)
+		}
+	}
+}
+
+// getServerPublicKey 从服务器获取公钥
+func getServerPublicKey(endpoint string) (wgtypes.Key, error) {
+	// 解析服务器地址和端口
+	host, portStr, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("解析服务器地址失败: %v", err)
+	}
+
+	// WireGuard使用UDP协议，直接尝试UDP连接
+	log.Printf("尝试使用UDP协议连接到服务器 %s...", endpoint)
+
+	// 如果用户指定了服务器公钥，直接返回
+	if *serverPubKey != "" {
+		log.Printf("使用用户指定的服务器公钥: %s", *serverPubKey)
+		key, err := wireguard.ParseKey(*serverPubKey)
+		if err != nil {
+			return wgtypes.Key{}, fmt.Errorf("解析服务器公钥失败: %v", err)
+		}
+		return key, nil
+	}
+
+	// 解析服务器地址
+	udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("解析服务器UDP地址失败: %v", err)
+	}
+
+	// 尝试连接
+	udpConn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("无法连接到服务器UDP端口: %v", err)
+	}
+
+	// 设置超时
+	udpConn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// 发送测试数据
+	_, err = udpConn.Write([]byte("WireGuard Test"))
+	if err != nil {
+		udpConn.Close()
+		return wgtypes.Key{}, fmt.Errorf("发送测试数据失败: %v", err)
+	}
+
+	// 关闭连接
+	udpConn.Close()
+	log.Printf("成功连接到服务器UDP端口")
+
+	// 如果服务器在本地运行，尝试从配置文件获取公钥
+	if host == "127.0.0.1" || host == "localhost" {
+		// 尝试读取服务器配置文件
+		configFile := "wg-server.conf"
+		data, err := os.ReadFile(configFile)
+		if err == nil {
+			// 解析配置文件中的公钥
+			content := string(data)
+			lines := strings.Split(content, "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "PublicKey=") {
+					pubKeyStr := strings.TrimPrefix(line, "PublicKey=")
+					pubKey, err := wireguard.ParseKey(pubKeyStr)
+					if err == nil {
+						log.Printf("从配置文件获取到服务器公钥: %s", pubKey.String())
+						return pubKey, nil
+					}
+				}
+			}
+		}
+	}
+
+	// 如果无法从配置文件获取，尝试使用UDP协议获取服务器公钥
+	// 注意：这只是一个简化的实现，实际上需要实现WireGuard协议的握手
+	// 这里我们只是模拟一个简单的请求
+	port, _ := strconv.Atoi(portStr)
+	addr := &net.UDPAddr{IP: net.ParseIP(host), Port: port}
+	udpConn2, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("无法创建UDP连接: %v", err)
+	}
+	defer udpConn2.Close()
+
+	// 发送请求
+	_, err = udpConn2.Write([]byte("GET_PUBLIC_KEY"))
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("发送请求失败: %v", err)
+	}
+
+	// 设置超时
+	udpConn2.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+	// 接收响应
+	buf := make([]byte, 1024)
+	n, _, err := udpConn2.ReadFromUDP(buf)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("接收响应失败: %v", err)
+	}
+
+	// 解析公钥
+	pubKeyStr := string(buf[:n])
+	pubKey, err := wireguard.ParseKey(pubKeyStr)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("解析服务器公钥失败: %v", err)
+	}
+
+	log.Printf("从服务器获取到公钥: %s", pubKey.String())
+	return pubKey, nil
+}
+
+// getTunIP 获取TUN设备的IP地址
+func getTunIP(tunName string) (string, error) {
+	switch runtime.GOOS {
+	case "windows":
+		// 获取接口索引
+		cmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceDescription -like '*TAP-Windows*' -or $_.InterfaceAlias -eq '%s'} | Select-Object -ExpandProperty ifIndex", tunName)
+		output, err := runCommand(cmd)
+		if err != nil {
+			return "", fmt.Errorf("获取网络接口失败: %v", err)
+		}
+
+		// 解析接口索引
+		ifIndex := strings.TrimSpace(output)
+		if ifIndex == "" {
+			return "", fmt.Errorf("无法找到WireGuard网络接口")
+		}
+
+		// 获取IP地址
+		cmd = fmt.Sprintf("Get-NetIPAddress -InterfaceIndex %s -AddressFamily IPv4 | Select-Object -ExpandProperty IPAddress", ifIndex)
+		output, err = runCommand(cmd)
+		if err != nil {
+			return "", fmt.Errorf("获取IP地址失败: %v", err)
+		}
+
+		// 解析IP地址
+		ip := strings.TrimSpace(output)
+		if ip == "" {
+			return "", fmt.Errorf("无法获取TUN设备IP地址")
+		}
+
+		return ip, nil
+
+	case "linux":
+		cmd := fmt.Sprintf("ip addr show %s | grep 'inet ' | awk '{print $2}' | cut -d/ -f1", tunName)
+		output, err := runCommand(cmd)
+		if err != nil {
+			return "", fmt.Errorf("获取IP地址失败: %v", err)
+		}
+
+		ip := strings.TrimSpace(output)
+		if ip == "" {
+			return "", fmt.Errorf("无法获取TUN设备IP地址")
+		}
+
+		return ip, nil
+
+	case "darwin": // macOS
+		cmd := fmt.Sprintf("ifconfig %s | grep 'inet ' | awk '{print $2}'", tunName)
+		output, err := runCommand(cmd)
+		if err != nil {
+			return "", fmt.Errorf("获取IP地址失败: %v", err)
+		}
+
+		ip := strings.TrimSpace(output)
+		if ip == "" {
+			return "", fmt.Errorf("无法获取TUN设备IP地址")
+		}
+
+		return ip, nil
+
+	default:
+		return "", fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
