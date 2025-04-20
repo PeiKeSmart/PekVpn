@@ -20,14 +20,16 @@ import (
 )
 
 var (
-	listenPort   = flag.Int("port", 23456, "WireGuard监听端口")
-	tunName      = flag.String("tun", "wg0", "TUN设备名称")
-	tunIP        = flag.String("ip", "10.8.0.1/24", "TUN设备IP地址")
-	configFile   = flag.String("config", "wg-server.conf", "WireGuard配置文件路径")
-	useAmnezia   = flag.Bool("amnezia", false, "是否使用AmneziaWG修改")
-	clientPubKey = flag.String("client-pubkey", "", "客户端公钥")
-	regEnabled   = flag.Bool("enable-reg", true, "是否启用客户端自动注册")
-	regSecret    = flag.String("reg-secret", "vpnsecret", "客户端注册密钥")
+	listenPort    = flag.Int("port", 23456, "WireGuard监听端口")
+	tunName       = flag.String("tun", "wg0", "TUN设备名称")
+	tunIP         = flag.String("ip", "10.8.0.1/24", "TUN设备IP地址")
+	configFile    = flag.String("config", "wg-server.conf", "WireGuard配置文件路径")
+	useAmnezia    = flag.Bool("amnezia", false, "是否使用AmneziaWG修改")
+	clientPubKey  = flag.String("client-pubkey", "", "客户端公钥")
+	regEnabled    = flag.Bool("enable-reg", true, "是否启用客户端自动注册")
+	regSecret     = flag.String("reg-secret", "vpnsecret", "客户端注册密钥")
+	clientTimeout = flag.Int("client-timeout", 10, "客户端超时时间(分钟)，超过此时间未响应的客户端将被自动清理")
+	autoCleanup   = flag.Bool("auto-cleanup", true, "是否自动清理超时的客户端")
 
 	// 客户端管理
 	clients     = make(map[wgtypes.Key]*wireguard.PeerInfo)
@@ -344,6 +346,43 @@ func saveConfig(config *wireguard.Config) {
 	}
 
 	log.Printf("配置已保存到: %s", *configFile)
+}
+
+// updateConfigFile 更新配置文件，反映当前客户端状态
+func updateConfigFile(wgDevice *wireguard.WireGuardDevice) {
+	// 获取当前所有客户端
+	peers, err := wgDevice.GetPeers()
+	if err != nil {
+		log.Printf("获取客户端列表失败: %v", err)
+		return
+	}
+
+	// 创建客户端配置列表
+	clientConfigs := make([]*wireguard.Config, 0, len(peers))
+	for _, peer := range peers {
+		// 创建客户端配置
+		clientConfig := &wireguard.Config{
+			PublicKey:  peer.PublicKey,
+			AllowedIPs: peer.AllowedIPs,
+		}
+		clientConfigs = append(clientConfigs, clientConfig)
+	}
+
+	// 生成配置文件内容
+	configContent := wgDevice.Config.GetWireGuardConfigString(true, clientConfigs)
+
+	// 添加公钥到配置文件
+	publicKey := wireguard.GeneratePublicKey(wgDevice.Config.PrivateKey)
+	configContent = strings.Replace(configContent, "[Interface]", "[Interface]\nPublicKey = "+publicKey.String(), 1)
+
+	// 保存到文件
+	err = os.WriteFile(*configFile, []byte(configContent), 0600)
+	if err != nil {
+		log.Printf("更新配置文件失败: %v", err)
+		return
+	}
+
+	log.Printf("配置文件已更新，移除了超时客户端")
 }
 
 // addClient 添加客户端
@@ -849,6 +888,13 @@ func addSpecificClient(serverConfig *wireguard.Config, wgDevice *wireguard.WireG
 func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 	// 初始化已知客户端映射
 	knownPeers := make(map[string]time.Time)
+	// 初始化超时警告映射，记录已经发出警告的客户端
+	timeoutWarnings := make(map[string]bool)
+
+	// 计算超时时间
+	timeoutDuration := time.Duration(*clientTimeout) * time.Minute
+	log.Printf("客户端超时时间设置为 %d 分钟", *clientTimeout)
+	log.Printf("自动清理超时客户端: %v", *autoCleanup)
 
 	// 每5秒检查一次客户端连接状态
 	for {
@@ -868,44 +914,73 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 			peerKey := peer.PublicKey.String()
 			currentPeers[peerKey] = true
 
+			// 获取客户端IP地址
+			ipStr := ""
+			if len(peer.AllowedIPs) > 0 {
+				ipStr = peer.AllowedIPs[0].IP.String()
+			} else if peer.IP != nil {
+				ipStr = peer.IP.String()
+			}
+
 			// 检查是否是新连接的客户端
 			_, exists := knownPeers[peerKey]
 			if !exists {
 				// 新客户端连接
-				ipStr := ""
-				if len(peer.AllowedIPs) > 0 {
-					ipStr = peer.AllowedIPs[0].IP.String()
-				} else if peer.IP != nil {
-					ipStr = peer.IP.String()
-				}
 				log.Printf("新客户端连接: %s, IP: %s", peerKey, ipStr)
 				knownPeers[peerKey] = time.Now()
+				// 清除超时警告标记
+				delete(timeoutWarnings, peerKey)
 			}
 
 			// 检查客户端活跃状态
 			if peer.LastHandshakeTime.After(knownPeers[peerKey]) {
 				// 客户端有新的握手，更新时间
-				ipStr := ""
-				if len(peer.AllowedIPs) > 0 {
-					ipStr = peer.AllowedIPs[0].IP.String()
-				} else if peer.IP != nil {
-					ipStr = peer.IP.String()
-				}
 				log.Printf("客户端活跃: %s, IP: %s, 最后握手时间: %s",
 					peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"))
 				knownPeers[peerKey] = peer.LastHandshakeTime
+				// 清除超时警告标记
+				delete(timeoutWarnings, peerKey)
 			}
 
 			// 检查客户端是否长时间未活跃
-			if time.Since(peer.LastHandshakeTime) > 3*time.Minute {
-				ipStr := ""
-				if len(peer.AllowedIPs) > 0 {
-					ipStr = peer.AllowedIPs[0].IP.String()
-				} else if peer.IP != nil {
-					ipStr = peer.IP.String()
+			inactiveTime := time.Since(peer.LastHandshakeTime)
+
+			// 如果超过警告时间（超时时间的50%），发出警告
+			warningTime := timeoutDuration / 2
+			if inactiveTime > warningTime && !timeoutWarnings[peerKey] {
+				log.Printf("警告: 客户端长时间未活跃: %s, IP: %s, 最后握手时间: %s, 不活跃时间: %s",
+					peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"), inactiveTime.Round(time.Second))
+				timeoutWarnings[peerKey] = true
+			}
+
+			// 如果超过超时时间且启用了自动清理，则清理客户端
+			if inactiveTime > timeoutDuration && *autoCleanup {
+				log.Printf("清理超时客户端: %s, IP: %s, 最后握手时间: %s, 不活跃时间: %s",
+					peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"), inactiveTime.Round(time.Second))
+
+				// 解析公钥
+				pubKey, err := wireguard.ParseKey(peerKey)
+				if err != nil {
+					log.Printf("解析客户端公钥失败: %v", err)
+					continue
 				}
-				log.Printf("客户端长时间未活跃: %s, IP: %s, 最后握手时间: %s",
-					peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"))
+
+				// 移除客户端
+				err = wgDevice.RemovePeer(pubKey)
+				if err != nil {
+					log.Printf("移除超时客户端失败: %v", err)
+				} else {
+					log.Printf("已成功移除超时客户端: %s", peerKey)
+					// 从已知客户端列表中移除
+					delete(knownPeers, peerKey)
+					// 清除超时警告标记
+					delete(timeoutWarnings, peerKey)
+					// 从当前客户端列表中移除
+					delete(currentPeers, peerKey)
+
+					// 更新配置文件，移除超时客户端的配置
+					updateConfigFile(wgDevice)
+				}
 			}
 		}
 
@@ -915,6 +990,8 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 				// 客户端断开连接
 				log.Printf("客户端断开连接: %s", peerKey)
 				delete(knownPeers, peerKey)
+				// 清除超时警告标记
+				delete(timeoutWarnings, peerKey)
 			}
 		}
 
