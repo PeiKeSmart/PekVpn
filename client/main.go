@@ -248,6 +248,9 @@ func main() {
 		implementAntiDetectionMeasures()
 	}()
 
+	// 启动连接监控和自动重连
+	go startConnectionMonitor(wgDevice, config)
+
 	// 定期重新探测MTU值
 	go func() {
 		// 等待VPN连接稳定
@@ -1799,20 +1802,33 @@ func doConfigureDNSAlternative(tunName string) error {
 
 // verifyDNS 验证DNS设置
 func verifyDNS() bool {
-	// 尝试解析一个域名
-	cmd := "nslookup google.com"
+	// 判断服务器是否在中国大陆
+	inChina := isServerInChina()
+
+	// 尝试解析中国大陆域名
+	cmd := "nslookup baidu.com"
 	_, err := runCommand(cmd)
 	if err != nil {
-		log.Printf("DNS验证失败: %v", err)
+		log.Printf("DNS验证失败(Baidu): %v", err)
 		return false
 	}
 
-	// 尝试解析另一个域名
-	cmd = "nslookup baidu.com"
+	// 尝试解析另一个中国大陆域名
+	cmd = "nslookup qq.com"
 	_, err = runCommand(cmd)
 	if err != nil {
-		log.Printf("DNS验证失败: %v", err)
+		log.Printf("DNS验证失败(QQ): %v", err)
 		return false
+	}
+
+	// 如果服务器在境外，尝试解析国际域名
+	if !inChina {
+		cmd = "nslookup google.com"
+		_, err = runCommand(cmd)
+		if err != nil {
+			log.Printf("DNS验证失败(Google): %v", err)
+			// 即使国际域名解析失败，也不影响整体验证结果
+		}
 	}
 
 	return true
@@ -1876,6 +1892,9 @@ func monitorAndOptimizeBaiduConnection(wgDevice *wireguard.WireGuardDevice) {
 func testInternetConnection() {
 	log.Printf("正在测试互联网连接...")
 
+	// 判断服务器是否在中国大陆
+	inChina := isServerInChina()
+
 	// 测试DNS解析 - 使用常用域名
 	cmd := "nslookup qq.com"
 	output, err := runCommand(cmd)
@@ -1885,22 +1904,39 @@ func testInternetConnection() {
 		log.Printf("DNS解析测试(QQ)成功")
 	}
 
-	// 测试DNS解析 - 使用Google域名
-	cmd = "nslookup google.com"
-	output, err = runCommand(cmd)
-	if err != nil {
-		log.Printf("DNS解析测试(Google)失败: %v\n%s", err, truncateOutput(output, 10))
+	// 根据服务器位置决定是否测试国际网站
+	if !inChina {
+		// 如果服务器在境外，测试Google域名
+		cmd = "nslookup google.com"
+		output, err = runCommand(cmd)
+		if err != nil {
+			log.Printf("DNS解析测试(Google)失败: %v\n%s", err, truncateOutput(output, 10))
+		} else {
+			log.Printf("DNS解析测试(Google)成功")
+		}
 	} else {
-		log.Printf("DNS解析测试(Google)成功")
+		log.Printf("服务器在中国大陆，跳过Google域名测试")
 	}
 
-	// 测试ICMP连接 - 使用Google DNS
-	cmd = "ping -n 3 8.8.8.8"
+	// 测试ICMP连接
+	var pingTarget string
+	var pingLabel string
+	if inChina {
+		// 如果服务器在中国大陆，使用百度DNS
+		pingTarget = "180.76.76.76"
+		pingLabel = "百度DNS"
+	} else {
+		// 如果服务器在境外，使用Google DNS
+		pingTarget = "8.8.8.8"
+		pingLabel = "Google DNS"
+	}
+
+	cmd = fmt.Sprintf("ping -n 3 %s", pingTarget)
 	output, err = runCommand(cmd)
 	if err != nil {
-		log.Printf("ICMP连接测试(Google DNS)失败: %v\n%s", err, truncateOutput(output, 10))
+		log.Printf("ICMP连接测试(%s)失败: %v\n%s", pingLabel, err, truncateOutput(output, 10))
 	} else {
-		log.Printf("ICMP连接测试(Google DNS)成功")
+		log.Printf("ICMP连接测试(%s)成功", pingLabel)
 	}
 
 	// 测试HTTP连接 - 使用常用网站
@@ -1925,26 +1961,31 @@ func testInternetConnection() {
 		log.Printf("HTTP连接测试(QQ)成功: %s", output)
 	}
 
-	// 测试HTTP连接 - 使用Google
-	if runtime.GOOS == "windows" {
-		// Windows上使用PowerShell的Invoke-WebRequest
-		cmd = "Invoke-WebRequest -Uri 'https://www.google.com' -UseBasicParsing -Method Head | Select-Object -ExpandProperty StatusCode"
-		output, err = runCommand(cmd)
-		if err != nil {
-			// 如果失败，尝试使用系统自带的curl
-			cmd = "cmd.exe /c curl -s -o nul -w \"HTTP状态码: %{http_code}\" https://www.google.com"
+	// 根据服务器位置决定是否测试国际网站
+	if !inChina {
+		// 如果服务器在境外，测试Google网站
+		if runtime.GOOS == "windows" {
+			// Windows上使用PowerShell的Invoke-WebRequest
+			cmd = "Invoke-WebRequest -Uri 'https://www.google.com' -UseBasicParsing -Method Head | Select-Object -ExpandProperty StatusCode"
+			output, err = runCommand(cmd)
+			if err != nil {
+				// 如果失败，尝试使用系统自带的curl
+				cmd = "cmd.exe /c curl -s -o nul -w \"HTTP状态码: %{http_code}\" https://www.google.com"
+				output, err = runCommand(cmd)
+			}
+		} else {
+			// 其他系统使用curl
+			cmd = "curl -s -o /dev/null -w \"HTTP状态码: %{http_code}\" https://www.google.com"
 			output, err = runCommand(cmd)
 		}
-	} else {
-		// 其他系统使用curl
-		cmd = "curl -s -o /dev/null -w \"HTTP状态码: %{http_code}\" https://www.google.com"
-		output, err = runCommand(cmd)
-	}
 
-	if err != nil {
-		log.Printf("HTTP连接测试(Google)失败: %v\n%s", err, truncateOutput(output, 10))
+		if err != nil {
+			log.Printf("HTTP连接测试(Google)失败: %v\n%s", err, truncateOutput(output, 10))
+		} else {
+			log.Printf("HTTP连接测试(Google)成功: %s", output)
+		}
 	} else {
-		log.Printf("HTTP连接测试(Google)成功: %s", output)
+		log.Printf("服务器在中国大陆，跳过Google网站测试")
 	}
 }
 
@@ -2304,8 +2345,8 @@ func (t *browserTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	// 设置编码
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 
-	// 设置连接
-	req.Header.Set("Connection", "keep-alive")
+	// 不设置 Connection 头部，因为它是受保护的
+	// req.Header.Set("Connection", "keep-alive")
 
 	// 设置升级不安全请求
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
@@ -2332,7 +2373,7 @@ func optimizeHTTPRequestParameters() {
 		"Accept" = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"
 		"Accept-Language" = "zh-CN,zh;q=0.9,en;q=0.8"
 		"Accept-Encoding" = "gzip, deflate, br"
-		"Connection" = "keep-alive"
+		# 移除Connection头部，因为它是受保护的
 		"Upgrade-Insecure-Requests" = "1"
 		"Sec-Fetch-Site" = "none"
 		"Sec-Fetch-Mode" = "navigate"
@@ -2444,4 +2485,460 @@ func testNetworkAfterClose() {
 	log.Printf("3. 执行 netsh int ip reset")
 	log.Printf("4. 重启网络适配器")
 	log.Printf("5. 如果仍然无法连接，请重启电脑")
+}
+
+// startConnectionMonitor 监控连接状态并在需要时自动重连
+func startConnectionMonitor(wgDevice *wireguard.WireGuardDevice, config *wireguard.Config) {
+	reconnectAttempts := 0
+	maxReconnectAttempts := 10
+	reconnectDelay := 5 * time.Second
+	lastReconnectTime := time.Time{}
+
+	// 添加稳定期和连续失败计数
+	stabilityPeriod := 5 * time.Minute // 重连后的稳定期，考虑握手周期为2分钟，给予充足的时间
+	consecutiveFailures := 0           // 连续检测失败次数
+	maxConsecutiveFailures := 3        // 触发重连的连续失败次数
+
+	for {
+		// 检查是否在稳定期内
+		inStabilityPeriod := !lastReconnectTime.IsZero() && time.Since(lastReconnectTime) < stabilityPeriod
+
+		// 如果在稳定期内，跳过断开检测
+		if inStabilityPeriod {
+			log.Printf("处于重连后稳定期，跳过断开检测（剩余 %s）",
+				(stabilityPeriod - time.Since(lastReconnectTime)).Round(time.Second))
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		// 检查连接状态
+		connected := checkConnectionStatus(wgDevice)
+
+		if !connected {
+			// 在报告"可能断开"之前，先进行一次DNS解析测试
+			// 判断服务器是否在中国大陆
+			inChina := isServerInChina()
+
+			// 选择适合的测试域名
+			testDomain := "qq.com" // 默认使用中国大陆网站
+			if !inChina {
+				testDomain = "google.com" // 如果服务器在境外，使用国际网站
+			}
+
+			cmd := fmt.Sprintf("nslookup %s", testDomain)
+			output, err := runCommand(cmd)
+			if err == nil && !strings.Contains(output, "server can't find") {
+				// DNS解析成功，说明网络可能正常，不增加失败计数
+				log.Printf("DNS解析测试(%s)成功，网络可能正常，不计入失败", testDomain)
+				continue
+			}
+
+			consecutiveFailures++
+			log.Printf("检测到可能断开，这是第 %d/%d 次连续检测失败",
+				consecutiveFailures, maxConsecutiveFailures)
+
+			// 只有连续多次检测失败才触发重连
+			if consecutiveFailures >= maxConsecutiveFailures {
+				log.Printf("检测到连接断开，尝试重新连接...")
+
+				// 如果上次重连尝试在一分钟内，增加重连延迟
+				if !lastReconnectTime.IsZero() && time.Since(lastReconnectTime) < time.Minute {
+					reconnectDelay *= 2 // 指数退避
+					if reconnectDelay > 60*time.Second {
+						reconnectDelay = 60 * time.Second // 最大延迟1分钟
+					}
+				}
+
+				// 尝试重新连接
+				if reconnectAttempts < maxReconnectAttempts {
+					reconnectAttempts++
+					log.Printf("重连尝试 %d/%d", reconnectAttempts, maxReconnectAttempts)
+					lastReconnectTime = time.Now()
+
+					// 重新初始化连接
+					err := reinitializeConnection(wgDevice, config)
+					if err != nil {
+						log.Printf("重连失败: %v", err)
+						// 等待一段时间再尝试
+						time.Sleep(reconnectDelay)
+					} else {
+						log.Printf("重连成功")
+						reconnectAttempts = 0
+						reconnectDelay = 5 * time.Second // 重置延迟
+						consecutiveFailures = 0          // 重置连续失败计数
+					}
+				} else {
+					log.Printf("达到最大重连尝试次数，请手动重启客户端")
+					// 等待一段时间再检查
+					time.Sleep(5 * time.Minute)
+					reconnectAttempts = 0 // 重置重连计数
+				}
+			} else {
+				// 连续失败次数未达到阈值，等待下次检查
+				log.Printf("等待下次检查确认连接状态")
+				time.Sleep(15 * time.Second) // 失败后缩短检查间隔
+			}
+		} else {
+			// 连接正常，重置连续失败计数
+			if consecutiveFailures > 0 {
+				log.Printf("连接状态恢复正常")
+				consecutiveFailures = 0
+			}
+
+			// 连接正常，重置重连计数
+			if reconnectAttempts > 0 {
+				log.Printf("连接已恢复")
+				reconnectAttempts = 0
+				reconnectDelay = 5 * time.Second
+			}
+
+			// 连接正常时，使用较长的检查间隔
+			time.Sleep(60 * time.Second)
+		}
+	}
+}
+
+// checkConnectionStatus 检查连接状态
+func checkConnectionStatus(wgDevice *wireguard.WireGuardDevice) bool {
+	// 判断服务器是否在中国大陆
+	inChina := isServerInChina()
+
+	// 首先检查DNS解析是否正常
+	// 根据服务器位置选择不同的测试网站
+	var testDomains []string
+	if inChina {
+		// 如果服务器在中国大陆，使用中国大陆的网站进行测试
+		testDomains = []string{"baidu.com", "qq.com", "taobao.com", "163.com"}
+		log.Printf("服务器在中国大陆，使用中国大陆网站进行测试")
+	} else {
+		// 如果服务器在境外，使用国际网站进行测试
+		testDomains = []string{"google.com", "youtube.com", "facebook.com", "twitter.com"}
+		log.Printf("服务器在境外，使用国际网站进行测试")
+	}
+
+	// 使用多个域名进行测试，只要有一个成功就认为连接正常
+	for _, domain := range testDomains {
+		cmd := fmt.Sprintf("nslookup %s", domain)
+		output, err := runCommand(cmd)
+		if err == nil && !strings.Contains(output, "server can't find") {
+			log.Printf("DNS解析测试(%s)成功，网络连接正常", domain)
+			return true
+		}
+		log.Printf("DNS解析测试(%s)失败", domain)
+	}
+
+	// 获取对等点信息
+	peers, err := wgDevice.GetPeers()
+	if err != nil {
+		log.Printf("获取对等点信息失败: %v", err)
+		// 即使获取对等点信息失败，也不直接判断连接断开
+		// 继续进行其他检测
+	} else if len(peers) == 0 {
+		log.Printf("无对等点信息，可能是初始化问题")
+		// 即使无对等点，也不直接判断连接断开
+		// 继续进行其他检测
+	} else {
+		// 检查最后握手时间
+		for _, peer := range peers {
+			// 使用最后数据接收时间和最后握手时间的最大值来判断
+			lastActiveTime := peer.LastHandshakeTime
+			if peer.LastDataReceived.After(lastActiveTime) {
+				lastActiveTime = peer.LastDataReceived
+			}
+
+			inactiveTime := time.Since(lastActiveTime)
+
+			// 考虑WireGuard的握手周期（2分钟），将容忍时间设为4分钟
+			// 这样即使错过一次握手也不会立即判断为断开
+			if inactiveTime < 4*time.Minute {
+				log.Printf("最后活跃时间在4分钟内，连接正常（%s前）", inactiveTime.Round(time.Second))
+				return true
+			}
+
+			log.Printf("最后活跃时间超过4分钟（%s前），尝试其他检测方法", inactiveTime.Round(time.Second))
+		}
+	}
+
+	// 尝试通过VPN隧道ping服务器内网IP
+	serverIP := getServerIP(wgDevice)
+	if serverIP != "" {
+		cmd := fmt.Sprintf("ping -c 1 -W 2 %s", serverIP)
+		if runtime.GOOS == "windows" {
+			cmd = fmt.Sprintf("ping -n 1 -w 2000 %s", serverIP)
+		}
+
+		_, err := runCommand(cmd)
+		if err == nil {
+			log.Printf("通过VPN隧道ping服务器内网IP成功，连接正常")
+			return true
+		}
+		log.Printf("通过VPN隧道ping服务器内网IP失败: %v", err)
+	}
+
+	// 尝试检查VPN接口状态
+	if runtime.GOOS == "windows" {
+		cmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.Name -eq '%s' -or $_.InterfaceDescription -like '*WireGuard*'} | Select-Object -ExpandProperty Status", wgDevice.TunName)
+		output, err := runCommand(cmd)
+		if err == nil && strings.Contains(strings.ToLower(output), "up") {
+			log.Printf("VPN接口状态为UP，连接可能正常")
+			return true
+		}
+		log.Printf("VPN接口状态检查失败或状态不是UP: %s", output)
+	}
+
+	// 尝试检查是否有活跃的VPN路由
+	if runtime.GOOS == "windows" {
+		cmd := "route print | findstr 10.8.0.0"
+		output, err := runCommand(cmd)
+		if err == nil && output != "" {
+			log.Printf("存在VPN路由，连接可能正常")
+			return true
+		}
+		log.Printf("未找到VPN路由")
+	}
+
+	// 尝试检查是否可以访问外部网站
+	if runtime.GOOS == "windows" {
+		cmd := "ping -n 1 -w 2000 8.8.8.8"
+		_, err := runCommand(cmd)
+		if err == nil {
+			// 可以ping通外部网站，但可能不是通过VPN
+			log.Printf("可以ping通外部网站，但可能不是通过VPN")
+			// 这里不返回true，因为我们不确定是否通过VPN
+		}
+	}
+
+	log.Printf("所有连接检测方法均失败，判断连接已断开")
+	return false
+}
+
+// getServerIP 获取服务器IP地址
+func getServerIP(wgDevice *wireguard.WireGuardDevice) string {
+	// 尝试从对等点信息获取
+	peers, err := wgDevice.GetPeers()
+	if err == nil && len(peers) > 0 {
+		// 假设第一个对等点是服务器
+		for _, peer := range peers {
+			if peer.IP != nil {
+				return peer.IP.String()
+			}
+		}
+	}
+
+	// 如果无法从对等点信息获取，尝试从配置文件或命令行参数获取
+	// 假设服务器IP在内网为10.8.0.1
+	serverIP := "10.8.0.1"
+	log.Printf("从对等点信息获取服务器IP失败，使用默认IP: %s", serverIP)
+	return serverIP
+}
+
+// isServerInChina 判断服务器是否在中国大陆
+func isServerInChina() bool {
+	// 从命令行参数获取服务器地址
+	host, _, err := net.SplitHostPort(*serverEndpoint)
+	if err != nil {
+		log.Printf("解析服务器地址失败: %v", err)
+		return true // 默认假设在中国大陆
+	}
+
+	// 如果是IP地址，判断是否属于中国大陆IP段
+	ip := net.ParseIP(host)
+	if ip != nil {
+		// 判断是否是内网IP
+		if ip.IsPrivate() || ip.IsLoopback() {
+			// 内网IP无法判断国家，默认假设在中国
+			return true
+		}
+
+		// 判断是否是中国大陆常见IP段
+		// 这里使用一些常见的中国大陆IP段进行简单判断
+		// 注意：这不是完整的判断，只是一个简单的判断
+
+		// 电信、联通、移动等常见IP段
+		chinaIPRanges := []string{
+			"27.0.0.0/8",  // 中国联通
+			"36.0.0.0/8",  // 中国电信
+			"39.0.0.0/8",  // 中国移动
+			"42.0.0.0/8",  // 中国电信
+			"58.0.0.0/8",  // 中国电信
+			"59.0.0.0/8",  // 中国电信
+			"60.0.0.0/8",  // 中国电信
+			"61.0.0.0/8",  // 中国电信
+			"101.0.0.0/8", // 中国电信
+			"103.0.0.0/8", // 中国移动
+			"106.0.0.0/8", // 中国电信
+			"111.0.0.0/8", // 中国电信
+			"112.0.0.0/8", // 中国电信
+			"113.0.0.0/8", // 中国电信
+			"114.0.0.0/8", // 中国电信
+			"115.0.0.0/8", // 中国电信
+			"116.0.0.0/8", // 中国电信
+			"117.0.0.0/8", // 中国电信
+			"118.0.0.0/8", // 中国电信
+			"119.0.0.0/8", // 中国电信
+			"120.0.0.0/8", // 中国电信
+			"121.0.0.0/8", // 中国电信
+			"122.0.0.0/8", // 中国电信
+			"123.0.0.0/8", // 中国电信
+			"124.0.0.0/8", // 中国电信
+			"125.0.0.0/8", // 中国电信
+			"139.0.0.0/8", // 中国电信
+			"140.0.0.0/8", // 中国电信
+			"153.0.0.0/8", // 中国电信
+			"175.0.0.0/8", // 中国电信
+			"180.0.0.0/8", // 中国电信
+			"182.0.0.0/8", // 中国电信
+			"183.0.0.0/8", // 中国电信
+			"202.0.0.0/8", // 中国电信
+			"210.0.0.0/8", // 中国电信
+			"211.0.0.0/8", // 中国电信
+			"218.0.0.0/8", // 中国电信
+			"220.0.0.0/8", // 中国电信
+			"221.0.0.0/8", // 中国电信
+			"222.0.0.0/8", // 中国电信
+			"223.0.0.0/8", // 中国电信
+		}
+
+		for _, cidr := range chinaIPRanges {
+			_, ipNet, err := net.ParseCIDR(cidr)
+			if err != nil {
+				continue
+			}
+
+			if ipNet.Contains(ip) {
+				log.Printf("服务器IP %s 属于中国大陆IP段 %s", ip.String(), cidr)
+				return true
+			}
+		}
+
+		log.Printf("服务器IP %s 不属于已知的中国大陆IP段", ip.String())
+		return false
+	}
+
+	// 如果是域名，判断是否是.cn域名
+	if strings.HasSuffix(host, ".cn") {
+		log.Printf("服务器域名 %s 以.cn结尾，判断为中国大陆服务器", host)
+		return true
+	}
+
+	// 如果无法判断，默认假设在中国大陆
+	log.Printf("无法判断服务器位置，默认假设在中国大陆")
+	return true
+}
+
+// addServerRoute 添加服务器特殊路由
+func addServerRoute(endpoint string) {
+	// 解析服务器地址
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		log.Printf("解析服务器地址失败: %v", err)
+		return
+	}
+
+	serverIP := net.ParseIP(host)
+	if serverIP == nil || serverIP.IsLoopback() {
+		log.Printf("无效的服务器IP地址: %s", host)
+		return
+	}
+
+	// 获取默认网关
+	defaultGateway := ""
+
+	// 使用route命令获取默认网关
+	cmd := "cmd.exe /c \"route print 0.0.0.0 | findstr 0.0.0.0 | findstr /v 127.0.0.1 | findstr /v 0.0.0.0/0\""
+	output, _ := runCommand(cmd)
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 {
+			defaultGateway = fields[2]
+			break
+		}
+	}
+
+	if defaultGateway != "" {
+		// 删除可能存在的路由
+		deleteCmd := fmt.Sprintf("route delete %s", serverIP.String())
+		_, _ = runCommand(deleteCmd)
+
+		// 添加服务器特殊路由，使用默认网关，使用非常低的metric值
+		addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask 255.255.255.255 %s metric 1\"", serverIP.String(), defaultGateway)
+		_, err = runCommand(addCmd)
+		if err == nil {
+			log.Printf("已添加服务器特殊路由: %s -> %s (优先级最高)", serverIP.String(), defaultGateway)
+		} else {
+			log.Printf("添加服务器特殊路由失败: %v", err)
+		}
+	} else {
+		log.Printf("无法获取默认网关，服务器特殊路由添加失败")
+	}
+}
+
+// reinitializeConnection 重新初始化连接
+func reinitializeConnection(wgDevice *wireguard.WireGuardDevice, config *wireguard.Config) error {
+	// 记录重连开始时间
+	startTime := time.Now()
+
+	// 关闭当前设备
+	wgDevice.Close()
+
+	// 等待一段时间
+	time.Sleep(1 * time.Second)
+
+	// 探测最佳MTU值
+	optimalMTU := detectOptimalMTU()
+	log.Printf("重连时使用MTU值: %d", optimalMTU)
+
+	// 重新创建设备
+	newDevice, err := wireguard.NewWireGuardDevice(config, false, optimalMTU)
+	if err != nil {
+		return fmt.Errorf("重新创建 WireGuard 设备失败: %v", err)
+	}
+
+	// 解析IP地址和子网掩码
+	ip, ipNet, err := net.ParseCIDR(*clientIP)
+	if err != nil {
+		newDevice.Close()
+		return fmt.Errorf("解析IP地址失败: %s, %v", *clientIP, err)
+	}
+
+	// 配置TUN设备IP地址
+	err = configureTunIP(newDevice.TunName, ip, ipNet)
+	if err != nil {
+		newDevice.Close()
+		return fmt.Errorf("配置TUN设备IP地址失败: %v", err)
+	}
+
+	// 更新设备引用
+	*wgDevice = *newDevice
+
+	// 重新配置路由
+	if *fullTunnel {
+		// 添加服务器特殊路由
+		addServerRoute(config.Endpoint)
+
+		// 添加VPN网段路由
+		for _, allowedIP := range config.AllowedIPs {
+			addRoute(allowedIP.String(), newDevice.TunName)
+		}
+
+		// 添加默认路由
+		_, defaultNet, _ := net.ParseCIDR("0.0.0.0/0")
+		addRoute(defaultNet.String(), newDevice.TunName)
+		log.Printf("已重新配置全局路由")
+	} else {
+		// 添加服务器特殊路由
+		addServerRoute(config.Endpoint)
+
+		// 添加VPN网段路由
+		for _, allowedIP := range config.AllowedIPs {
+			addRoute(allowedIP.String(), newDevice.TunName)
+		}
+		log.Printf("已重新配置分流路由")
+	}
+
+	// 记录重连完成时间
+	log.Printf("重连完成，耗时: %s", time.Since(startTime).Round(time.Millisecond))
+
+	return nil
 }

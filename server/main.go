@@ -943,20 +943,45 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 			}
 
 			// 检查客户端是否长时间未活跃
-			inactiveTime := time.Since(peer.LastHandshakeTime)
+			// 使用最后数据接收时间和最后握手时间的最大值来判断
+			lastActiveTime := peer.LastHandshakeTime
+			if peer.LastDataReceived.After(lastActiveTime) {
+				lastActiveTime = peer.LastDataReceived
+			}
+			inactiveTime := time.Since(lastActiveTime)
 
 			// 如果超过警告时间（超时时间的50%），发出警告
 			warningTime := timeoutDuration / 2
 			if inactiveTime > warningTime && !timeoutWarnings[peerKey] {
-				log.Printf("警告: 客户端长时间未活跃: %s, IP: %s, 最后握手时间: %s, 不活跃时间: %s",
-					peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"), inactiveTime.Round(time.Second))
+				log.Printf("警告: 客户端长时间未活跃: %s, IP: %s, 最后活跃时间: %s, 不活跃时间: %s",
+					peerKey, ipStr, lastActiveTime.Format("2006-01-02 15:04:05"), inactiveTime.Round(time.Second))
 				timeoutWarnings[peerKey] = true
 			}
 
 			// 如果超过超时时间且启用了自动清理，则清理客户端
 			if inactiveTime > timeoutDuration && *autoCleanup {
-				log.Printf("清理超时客户端: %s, IP: %s, 最后握手时间: %s, 不活跃时间: %s",
-					peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"), inactiveTime.Round(time.Second))
+				// 添加额外检查：尝试ping客户端
+				clientAlive := false
+				if peer.IP != nil {
+					cmd := fmt.Sprintf("ping -c 1 -W 2 %s", peer.IP.String())
+					if runtime.GOOS == "windows" {
+						cmd = fmt.Sprintf("ping -n 1 -w 2000 %s", peer.IP.String())
+					}
+
+					_, err := runCommand(cmd)
+					clientAlive = (err == nil)
+				}
+
+				// 如果ping成功，更新最后活跃时间并跳过清理
+				if clientAlive {
+					log.Printf("客户端仍然活跃(ping成功): %s, IP: %s", peerKey, ipStr)
+					knownPeers[peerKey] = time.Now()
+					delete(timeoutWarnings, peerKey)
+					continue
+				}
+
+				log.Printf("清理超时客户端: %s, IP: %s, 最后活跃时间: %s, 不活跃时间: %s",
+					peerKey, ipStr, lastActiveTime.Format("2006-01-02 15:04:05"), inactiveTime.Round(time.Second))
 
 				// 解析公钥
 				pubKey, err := wireguard.ParseKey(peerKey)

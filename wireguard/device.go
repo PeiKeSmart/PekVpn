@@ -7,6 +7,8 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +40,7 @@ type PeerInfo struct {
 	IsLoggedIn        bool
 	PublicKey         wgtypes.Key // 对等点公钥
 	LastHandshakeTime time.Time   // 最后握手时间
+	LastDataReceived  time.Time   // 最后数据接收时间
 	AllowedIPs        []net.IPNet // 允许的IP地址
 }
 
@@ -320,6 +323,7 @@ func (wg *WireGuardDevice) AddPeer(peerConfig *Config, peerIP net.IP) error {
 		IsLoggedIn:        true,
 		PublicKey:         peerConfig.PublicKey,
 		LastHandshakeTime: time.Now(),
+		LastDataReceived:  time.Now(),
 		AllowedIPs:        allowedIPs,
 	}
 	wg.PeersLock.Unlock()
@@ -359,6 +363,71 @@ func (wg *WireGuardDevice) GetPeers() ([]*PeerInfo, error) {
 
 	// 创建结果切片
 	result := make([]*PeerInfo, 0, len(wg.Peers))
+
+	// 直接从设备获取当前状态
+	// 使用 IpcGet 获取设备状态
+	deviceInfo, err := wg.Device.IpcGet()
+	if err == nil {
+		// 解析设备状态信息
+		lines := strings.Split(deviceInfo, "\n")
+		var currentPeer string
+		var lastHandshake time.Time
+		var hasData bool
+
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "peer:") {
+				// 新的对等点开始
+				currentPeer = strings.TrimSpace(strings.TrimPrefix(line, "peer:"))
+				lastHandshake = time.Time{}
+				hasData = false
+			} else if strings.HasPrefix(line, "last handshake:") {
+				// 解析最后握手时间
+				handshakeStr := strings.TrimSpace(strings.TrimPrefix(line, "last handshake:"))
+				if handshakeStr != "0" && handshakeStr != "(none)" {
+					// 尝试解析时间
+					seconds, err := strconv.ParseInt(handshakeStr, 10, 64)
+					if err == nil {
+						lastHandshake = time.Unix(seconds, 0)
+					}
+				}
+			} else if strings.HasPrefix(line, "rx bytes:") || strings.HasPrefix(line, "tx bytes:") {
+				// 检查是否有数据传输
+				bytesStr := strings.TrimSpace(strings.Split(line, ":")[1])
+				bytes, err := strconv.ParseInt(bytesStr, 10, 64)
+				if err == nil && bytes > 0 {
+					hasData = true
+				}
+			}
+
+			// 如果已经处理完一个对等点的所有信息
+			if (line == "" || strings.HasPrefix(line, "peer:")) && currentPeer != "" {
+				// 尝试解析公钥
+				pubKey, err := ParseKey(currentPeer)
+				if err == nil {
+					// 更新对等点信息
+					if peerInfo, exists := wg.Peers[pubKey]; exists {
+						// 更新最后握手时间
+						if !lastHandshake.IsZero() && lastHandshake.After(peerInfo.LastHandshakeTime) {
+							peerInfo.LastHandshakeTime = lastHandshake
+							// 如果有新的握手，也更新数据接收时间
+							peerInfo.LastDataReceived = lastHandshake
+						}
+
+						// 如果有数据传输，更新最后数据接收时间
+						if hasData {
+							peerInfo.LastDataReceived = time.Now()
+						}
+					}
+				}
+
+				// 重置当前对等点
+				if line == "" {
+					currentPeer = ""
+				}
+			}
+		}
+	}
 
 	// 遍历所有对等点
 	for _, peer := range wg.Peers {
