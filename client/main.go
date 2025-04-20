@@ -1758,15 +1758,45 @@ func testInternetConnection() {
 
 // isNetworkConnected 检查网络连接状态
 func isNetworkConnected() bool {
-	// 尝试访问百度
-	cmd := "curl -s -o nul -w \"%{http_code}\" https://www.baidu.com"
+	// 检查方法1: 尝试访问百度
+	cmd := "curl -s -o nul -w \"%{http_code}\" --connect-timeout 5 https://www.baidu.com"
 	output, err := runCommand(cmd)
-	if err != nil {
-		log.Printf("网络连接检测失败: %v", err)
-		return false
+	if err == nil && strings.Contains(output, "200") {
+		log.Printf("网络连接正常: 可以访问百度")
+		return true
 	}
 
-	return strings.Contains(output, "200")
+	// 检查方法2: 尝试访问其他网站
+	cmd = "curl -s -o nul -w \"%{http_code}\" --connect-timeout 5 https://www.qq.com"
+	output, err = runCommand(cmd)
+	if err == nil && strings.Contains(output, "200") {
+		log.Printf("网络连接正常: 可以访问QQ")
+		return true
+	}
+
+	// 检查方法3: 尝试DNS解析
+	cmd = "nslookup baidu.com"
+	_, err = runCommand(cmd)
+	if err == nil {
+		// DNS解析正常，再次尝试HTTP连接
+		cmd = "curl -s -o nul -w \"%{http_code}\" --connect-timeout 5 https://www.baidu.com"
+		output, err = runCommand(cmd)
+		if err == nil && strings.Contains(output, "200") {
+			log.Printf("网络连接正常: DNS解析正常且可以访问百度")
+			return true
+		}
+	}
+
+	// 检查方法4: 尝试ping百度
+	cmd = "ping -n 1 -w 1000 baidu.com"
+	_, err = runCommand(cmd)
+	if err == nil {
+		log.Printf("网络连接正常: 可以ping通百度")
+		return true
+	}
+
+	log.Printf("网络连接检测失败: 所有检测方法均失败")
+	return false
 }
 
 // resetDNS 重置DNS设置
@@ -1807,14 +1837,74 @@ func restartDNSService() bool {
 	}
 
 	log.Printf("尝试重启DNS服务...")
-	cmd := "Restart-Service -Name Dnscache -Force"
-	_, _ = runCommand(cmd)
+
+	// 方法1: 使用PowerShell重启DNS服务
+	cmd := "Restart-Service -Name Dnscache -Force -ErrorAction SilentlyContinue"
+	output, err := runCommand(cmd)
+	if err != nil {
+		log.Printf("使用PowerShell重启DNS服务失败: %v, 输出: %s", err, truncateOutput(output, 5))
+
+		// 方法2: 使用net stop/start命令
+		log.Printf("尝试使用net命令重启DNS服务...")
+		cmd = "cmd.exe /c \"net stop Dnscache /y\""
+		stopOutput, stopErr := runCommand(cmd)
+		if stopErr != nil {
+			log.Printf("停止DNS服务失败: %v, 输出: %s", stopErr, truncateOutput(stopOutput, 5))
+		} else {
+			log.Printf("已停止DNS服务")
+		}
+		time.Sleep(1 * time.Second)
+
+		cmd = "cmd.exe /c \"net start Dnscache\""
+		startOutput, startErr := runCommand(cmd)
+		if startErr != nil {
+			log.Printf("启动DNS服务失败: %v, 输出: %s", startErr, truncateOutput(startOutput, 5))
+		} else {
+			log.Printf("已启动DNS服务")
+		}
+
+		// 方法3: 使用sc命令
+		if stopErr != nil || startErr != nil {
+			log.Printf("尝试使用sc命令重启DNS服务...")
+			cmd = "cmd.exe /c \"sc stop Dnscache\""
+			stopOutput, stopErr = runCommand(cmd)
+			if stopErr != nil {
+				log.Printf("使用sc停止DNS服务失败: %v, 输出: %s", stopErr, truncateOutput(stopOutput, 5))
+			} else {
+				log.Printf("已使用sc停止DNS服务")
+			}
+			time.Sleep(1 * time.Second)
+
+			cmd = "cmd.exe /c \"sc start Dnscache\""
+			startOutput, startErr = runCommand(cmd)
+			if startErr != nil {
+				log.Printf("使用sc启动DNS服务失败: %v, 输出: %s", startErr, truncateOutput(startOutput, 5))
+			} else {
+				log.Printf("已使用sc启动DNS服务")
+			}
+		}
+	} else {
+		log.Printf("使用PowerShell重启DNS服务成功")
+	}
+
+	log.Printf("已完成DNS客户端服务重启尝试")
 
 	// 等待服务重启
 	time.Sleep(2 * time.Second)
 
+	// 刷新DNS缓存
+	log.Printf("刷新DNS缓存...")
+	flushDNSCache()
+
 	// 验证DNS设置
-	return verifyDNS()
+	log.Printf("验证DNS设置...")
+	if verifyDNS() {
+		log.Printf("DNS设置验证成功")
+		return true
+	} else {
+		log.Printf("DNS设置验证失败")
+		return false
+	}
 }
 
 // restartNetworkAdapters 重启网络适配器
@@ -1823,28 +1913,62 @@ func restartNetworkAdapters() bool {
 		return false
 	}
 
-	log.Printf("尝试重启网络适配器...")
+	log.Printf("正在重启网络适配器...")
 
 	// 获取物理网络适配器
 	cmd := "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*' -and $_.InterfaceDescription -notlike '*TAP-Windows*'} | Select-Object -ExpandProperty Name"
-	output, _ := runCommand(cmd)
+	output, err := runCommand(cmd)
+	if err != nil {
+		log.Printf("获取网络适配器失败: %v", err)
+		return false
+	}
+
 	adapters := strings.Split(strings.TrimSpace(output), "\n")
+	if len(adapters) == 0 || (len(adapters) == 1 && adapters[0] == "") {
+		log.Printf("未找到物理网络适配器")
+		return false
+	}
+
+	log.Printf("找到%d个网络适配器", len(adapters))
 
 	// 重新启用物理网络适配器
 	for _, adapter := range adapters {
 		adapter = strings.TrimSpace(adapter)
 		if adapter != "" {
+			log.Printf("正在重启网络适配器: %s", adapter)
 			cmd = fmt.Sprintf("Restart-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
-			_, _ = runCommand(cmd)
-			log.Printf("已重新启用网络适配器: %s", adapter)
+			restartOutput, restartErr := runCommand(cmd)
+			if restartErr != nil {
+				log.Printf("重启网络适配器失败: %s, 错误: %v, 输出: %s", adapter, restartErr, truncateOutput(restartOutput, 5))
+
+				// 尝试使用禁用/启用的方式
+				log.Printf("尝试禁用然后启用网络适配器: %s", adapter)
+				cmd = fmt.Sprintf("Disable-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
+				_, _ = runCommand(cmd)
+				time.Sleep(2 * time.Second)
+
+				cmd = fmt.Sprintf("Enable-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
+				_, _ = runCommand(cmd)
+				log.Printf("已禁用然后启用网络适配器: %s", adapter)
+			} else {
+				log.Printf("已重启网络适配器: %s", adapter)
+			}
 		}
 	}
 
 	// 等待网络适配器重启
+	log.Printf("等待网络适配器重启生效...")
 	time.Sleep(5 * time.Second)
 
 	// 验证网络连接
-	return isNetworkConnected()
+	log.Printf("验证网络连接...")
+	if isNetworkConnected() {
+		log.Printf("网络连接验证成功")
+		return true
+	} else {
+		log.Printf("网络连接验证失败")
+		return false
+	}
 }
 
 // resetNetworkStack 重置网络协议栈
@@ -1895,29 +2019,51 @@ func testNetworkAfterClose() {
 		if strings.Contains(output, "0.0.0.0          0.0.0.0") {
 			log.Printf("发现默认路由，尝试清理...")
 			deleteRoute("0.0.0.0/0")
+
+			// 清理路由后再次检查网络连接
+			if isNetworkConnected() {
+				log.Printf("清理默认路由后，网络连接已恢复")
+				return
+			}
 		}
 	}
 
+	// 尝试刷新DNS缓存
+	log.Printf("尝试刷新DNS缓存...")
+	flushDNSCache()
+	if isNetworkConnected() {
+		log.Printf("刷新DNS缓存后，网络连接已恢复")
+		return
+	}
+
 	// 尝试重置DNS
-	if resetDNS() && isNetworkConnected() {
+	log.Printf("尝试重置DNS设置...")
+	resetDNS()
+	if isNetworkConnected() {
 		log.Printf("重置DNS后，网络连接已恢复")
 		return
 	}
 
 	// 尝试重启DNS服务
-	if restartDNSService() && isNetworkConnected() {
+	log.Printf("尝试重启DNS服务...")
+	restartDNSService()
+	if isNetworkConnected() {
 		log.Printf("重启DNS服务后，网络连接已恢复")
 		return
 	}
 
 	// 尝试重启网络适配器
-	if restartNetworkAdapters() && isNetworkConnected() {
+	log.Printf("尝试重启网络适配器...")
+	restartNetworkAdapters()
+	if isNetworkConnected() {
 		log.Printf("重启网络适配器后，网络连接已恢复")
 		return
 	}
 
 	// 尝试重置网络协议栈
-	if resetNetworkStack() && isNetworkConnected() {
+	log.Printf("尝试重置网络协议栈...")
+	resetNetworkStack()
+	if isNetworkConnected() {
 		log.Printf("重置网络协议栈后，网络连接已恢复")
 		return
 	}
