@@ -1,4 +1,5 @@
 @echo off
+chcp 936
 echo ===================================================
 echo    PekHight VPN 服务器启动脚本 (Windows 家庭版)
 echo ===================================================
@@ -31,12 +32,7 @@ powershell -ExecutionPolicy Bypass -Command "netsh advfirewall firewall add rule
 echo 防火墙规则已配置
 
 echo.
-echo 步骤4: 等待 WireGuard 接口创建...
-echo 注意: 服务器将在启动后创建 WireGuard 接口
-echo 启动服务器后，请等待几秒钟，然后再尝试配置 Internet 连接共享
-
-echo.
-echo 步骤5: 启动 VPN 服务器...
+echo 步骤4: 启动 VPN 服务器...
 echo 正在启动 VPN 服务器，请保持此窗口打开
 start /b pekserver.exe -port 23456 -enable-reg -skip-ip-forward-check=true
 if %errorlevel% neq 0 (
@@ -47,13 +43,13 @@ if %errorlevel% neq 0 (
 echo VPN 服务器已启动
 
 echo.
-echo 步骤6: 等待 WireGuard 接口创建...
+echo 步骤5: 等待 WireGuard 接口创建...
 timeout /t 5 /nobreak
 echo 正在检查 WireGuard 接口...
 
 echo.
-echo 步骤7: 配置 Internet 连接共享...
-powershell -ExecutionPolicy Bypass -File configure_ics.ps1
+echo 步骤6: 配置 Internet 连接共享...
+powershell -ExecutionPolicy Bypass -Command "$publicConnection = Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*' -and $_.InterfaceDescription -notlike '*TAP-Windows*'} | Select-Object -First 1; Start-Sleep -Seconds 2; $vpnConnection = Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceDescription -like '*TAP-Windows*' -or $_.InterfaceAlias -like '*WireGuard*'} | Select-Object -First 1; if($publicConnection -and $vpnConnection) { Write-Host ('使用 ' + $publicConnection.Name + ' 共享到 ' + $vpnConnection.Name); try { $netShare = New-Object -ComObject HNetCfg.HNetShare; $connection = $netShare.EnumEveryConnection | Where-Object { $netShare.NetConnectionProps.Invoke($_).Name -eq $publicConnection.Name }; if ($connection) { $config = $netShare.INetSharingConfigurationForINetConnection.Invoke($connection); $config.EnableSharing(0); Write-Host ('已启用 ' + $publicConnection.Name + ' 的共享'); }; $wgConnection = $netShare.EnumEveryConnection | Where-Object { $netShare.NetConnectionProps.Invoke($_).Name -eq $vpnConnection.Name }; if ($wgConnection) { $wgConfig = $netShare.INetSharingConfigurationForINetConnection.Invoke($wgConnection); $wgConfig.EnableSharing(1); Write-Host ('已启用 ' + $vpnConnection.Name + ' 的共享'); } else { Write-Host ('无法找到 ' + $vpnConnection.Name + ' 的连接配置'); } } catch { Write-Host ('启用共享时出错: ' + $_); Write-Host '请手动配置Internet连接共享'; } } else { Write-Host '未找到所需网络接口，请手动配置 Internet 连接共享'; }"
 
 echo.
 echo ===================================================
@@ -61,8 +57,7 @@ echo    VPN 服务器已启动并配置完成
 echo ===================================================
 echo.
 echo 如果客户端连接后无法访问互联网，请尝试以下操作:
-echo 1. 运行 manual_configure_ics.bat 脚本尝试手动配置
-echo 2. 手动配置 Internet 连接共享:
+echo 1. 手动配置 Internet 连接共享:
 echo    a. 打开"网络连接"(按 Win+R，输入 ncpa.cpl)
 echo    b. 右键点击您的主要网络连接(通常是连接到互联网的那个)
 echo    c. 选择"属性"
