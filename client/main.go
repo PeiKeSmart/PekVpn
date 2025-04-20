@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -43,6 +44,10 @@ var (
 	globalMTU      int          // 当前使用的MTU值
 	mtuMutex       sync.RWMutex // 保护globalMTU的互斥锁
 	mtuInitialized bool         // MTU是否已初始化
+
+	// 反检测相关的全局变量
+	antiDetectionEnabled bool              // 是否启用反检测措施
+	defaultTransport     http.RoundTripper // 原始Transport备份
 )
 
 func main() {
@@ -238,6 +243,10 @@ func main() {
 		time.Sleep(5 * time.Second)
 		testInternetConnection()
 
+		// 实施反检测措施
+		time.Sleep(1 * time.Second)
+		implementAntiDetectionMeasures()
+
 		// 诊断百度网站连接
 		time.Sleep(2 * time.Second)
 		diagnoseBaiduConnection()
@@ -405,7 +414,18 @@ func main() {
 		time.Sleep(3 * time.Second)
 	}
 
-	// 6. 测试网络连接是否恢复
+	// 6. 恢复反检测措施
+	if antiDetectionEnabled {
+		log.Printf("恢复反检测措施...")
+		// 恢复原始Transport
+		if defaultTransport != nil {
+			http.DefaultTransport = defaultTransport
+			log.Printf("已恢复原始Transport")
+		}
+		antiDetectionEnabled = false
+	}
+
+	// 7. 测试网络连接是否恢复
 	go func() {
 		time.Sleep(2 * time.Second)
 		testNetworkAfterClose()
@@ -2445,6 +2465,144 @@ func resetNetworkStack() bool {
 
 	// 验证网络连接
 	return isNetworkConnected()
+}
+
+// implementAntiDetectionMeasures 实施反检测措施
+func implementAntiDetectionMeasures() {
+	log.Printf("正在实施反检测措施...")
+
+	// 如果已经启用了反检测措施，直接返回
+	if antiDetectionEnabled {
+		log.Printf("反检测措施已启用")
+		return
+	}
+
+	// 1. 模拟浏览器行为
+	simulateNormalBrowserBehavior()
+
+	// 2. 优化HTTP请求参数
+	optimizeHTTPRequestParameters()
+
+	// 标记反检测措施已启用
+	antiDetectionEnabled = true
+	log.Printf("反检测措施已实施")
+}
+
+// simulateNormalBrowserBehavior 模拟正常浏览器行为
+func simulateNormalBrowserBehavior() {
+	log.Printf("正在模拟正常浏览器行为...")
+
+	// 备份原始Transport
+	defaultTransport = http.DefaultTransport
+
+	// 创建自定义Transport
+	customTransport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			DualStack: true,
+		}).DialContext,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConnsPerHost:   10,
+		DisableCompression:    false,
+	}
+
+	// 替换默认Transport
+	http.DefaultTransport = &browserTransport{
+		base: customTransport,
+	}
+
+	log.Printf("浏览器行为模拟已启用")
+}
+
+// browserTransport 模拟浏览器行为的Transport
+type browserTransport struct {
+	base http.RoundTripper
+}
+
+// RoundTrip 实现http.RoundTripper接口
+func (t *browserTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// 随机选择User-Agent
+	userAgents := []string{
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
+	}
+	index := int(time.Now().UnixNano()) % len(userAgents)
+	req.Header.Set("User-Agent", userAgents[index])
+
+	// 设置Accept头
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9")
+
+	// 设置语言
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+
+	// 设置编码
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+
+	// 设置连接
+	req.Header.Set("Connection", "keep-alive")
+
+	// 设置升级不安全请求
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+
+	// 添加随机的Cookie
+	if time.Now().UnixNano()%2 == 0 {
+		req.Header.Set("Cookie", fmt.Sprintf("session_id=%d; visit_count=%d",
+			time.Now().UnixNano(), time.Now().UnixNano()%10+1))
+	}
+
+	// 使用基础Transport发送请求
+	return t.base.RoundTrip(req)
+}
+
+// optimizeHTTPRequestParameters 优化HTTP请求参数
+func optimizeHTTPRequestParameters() {
+	log.Printf("正在优化HTTP请求参数...")
+
+	// 创建一个模拟正常浏览器的PowerShell脚本
+	scriptContent := `
+	# 设置User-Agent为常见浏览器
+	$headers = @{
+		"User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+		"Accept" = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"
+		"Accept-Language" = "zh-CN,zh;q=0.9,en;q=0.8"
+		"Accept-Encoding" = "gzip, deflate, br"
+		"Connection" = "keep-alive"
+		"Upgrade-Insecure-Requests" = "1"
+		"Sec-Fetch-Site" = "none"
+		"Sec-Fetch-Mode" = "navigate"
+		"Sec-Fetch-User" = "?1"
+		"Sec-Fetch-Dest" = "document"
+	}
+
+	# 尝试访问百度
+	try {
+		$response = Invoke-WebRequest -Uri "https://www.baidu.com" -Headers $headers -UseBasicParsing -TimeoutSec 10
+		Write-Output "百度访问成功，状态码: $($response.StatusCode)"
+	} catch {
+		Write-Output "百度访问失败: $_"
+	}
+	`
+
+	// 保存脚本到临时文件
+	scriptPath := os.TempDir() + "\\simulate_browser.ps1"
+	err := os.WriteFile(scriptPath, []byte(scriptContent), 0644)
+	if err != nil {
+		log.Printf("保存脚本失败: %v", err)
+		return
+	}
+
+	// 执行脚本
+	cmd := fmt.Sprintf("powershell -ExecutionPolicy Bypass -File \"%s\"", scriptPath)
+	output, _ := runCommand(cmd)
+	log.Printf("模拟浏览器结果: %s", output)
+
+	log.Printf("HTTP请求参数优化完成")
 }
 
 // testNetworkAfterClose 测试关闭VPN后的网络连接
