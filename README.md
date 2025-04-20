@@ -185,6 +185,24 @@ pekclient.exe -server <服务器地址:端口>
 
 ## 常见问题
 
+### Windows 10/11 没有 Routing and Remote Access 服务
+
+Windows 10 和 Windows 11 家庭版没有内置的 Routing and Remote Access 服务（RRAS），这会导致 VPN 服务器启动失败。解决方案：
+
+1. **使用不依赖 RRAS 的启动脚本**：
+
+   我们提供了一个专为 Windows 家庭版设计的启动脚本 `start_server_windows_home.bat`，它包含以下功能：
+   - 启用 IP 转发
+   - 配置防火墙规则
+   - 启动 VPN 服务器
+   - 配置 Internet 连接共享
+
+   使用方法：右键点击脚本，选择“以管理员身份运行”
+
+2. **使用第三方 NAT 工具**：如 ForwardIP 或 WinNAT
+
+3. **在虚拟机中运行 Linux 服务器**：在 VirtualBox 或 VMware 中运行 Linux 版本的服务器
+
 ### 创建 TUN 设备失败
 
 - 确保以管理员/root 权限运行程序
@@ -233,6 +251,7 @@ copy "C:\Program Files\WireGuard\wintun.dll" .
    ```
 
 2. **在客户端中使用**：
+
    ```bash
    # Windows
    pekclient.exe -server <服务器IP>:23456 -server-pubkey AbCdEfGhIjKlMnOpQrStUvWxYz1234567890AbCd=
@@ -243,6 +262,7 @@ copy "C:\Program Files\WireGuard\wintun.dll" .
 
 3. **验证连接**：
    连接建立后，可以使用以下命令验证是否使用了正确的服务器公钥：
+
    ```bash
    # Windows
    wg show
@@ -250,6 +270,7 @@ copy "C:\Program Files\WireGuard\wintun.dll" .
    # Linux/macOS
    sudo wg show
    ```
+
    输出中应该包含服务器的公钥信息。
 
 4. **为什么需要手动指定服务器公钥？**
