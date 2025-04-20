@@ -42,12 +42,25 @@ type PeerInfo struct {
 }
 
 // NewWireGuardDevice 创建一个新的WireGuard设备
-func NewWireGuardDevice(config *Config, isServer bool) (*WireGuardDevice, error) {
+func NewWireGuardDevice(config *Config, isServer bool, mtu ...int) (*WireGuardDevice, error) {
 	// 创建日志记录器
 	logger := log.New(os.Stdout, "", log.LstdFlags)
 
+	// 处理MTU参数
+	var mtuValue int
+	if len(mtu) > 0 && mtu[0] > 0 {
+		mtuValue = mtu[0]
+		logger.Printf("使用指定的MTU值: %d", mtuValue)
+	} else {
+		// 使用默认值
+		mtuValue = 1420
+		if !isServer {
+			mtuValue = 1380 // 客户端使用更保守的MTU值
+		}
+	}
+
 	// 创建TUN设备
-	tunDevice, tunName, err := createTunDevice(isServer)
+	tunDevice, tunName, err := createTunDevice(isServer, mtuValue)
 	if err != nil {
 		return nil, fmt.Errorf("创建TUN设备失败: %v", err)
 	}
@@ -93,7 +106,7 @@ func NewWireGuardDevice(config *Config, isServer bool) (*WireGuardDevice, error)
 }
 
 // createTunDevice 创建TUN设备
-func createTunDevice(isServer bool) (tun.Device, string, error) {
+func createTunDevice(isServer bool, mtu int) (tun.Device, string, error) {
 	// 设置TUN设备名称
 	tunName := "wg0"
 	if isServer {
@@ -121,8 +134,12 @@ func createTunDevice(isServer bool) (tun.Device, string, error) {
 		}
 	}
 
-	// 设置MTU
-	mtu := 1420 // WireGuard推荐的MTU值
+	// 使用指定的MTU值
+	if mtu <= 0 {
+		// 如果没有指定MTU，使用默认值
+		mtu = 1420 // WireGuard推荐的MTU值
+	}
+	log.Printf("使用MTU值: %d", mtu)
 
 	// 使用wireguard-go的原生TUN实现
 	var tunDevice tun.Device

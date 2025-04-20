@@ -33,6 +33,7 @@ var (
 	regSecret      = flag.String("reg-secret", "vpnsecret", "注册密钥")
 	fullTunnel     = flag.Bool("full-tunnel", true, "是否启用全局代理模式")
 	useDNSProxy    = flag.Bool("dns-proxy", false, "是否使用DNS代理")
+	mtuValue       = flag.Int("mtu", 0, "MTU值，0表示自动探测")
 
 	// 系统信息
 	hostname, _ = os.Hostname()
@@ -92,8 +93,12 @@ func main() {
 		log.Printf("已应用AmneziaWG特定修改")
 	}
 
+	// 探测最佳MTU值
+	optimalMTU := detectOptimalMTU()
+	log.Printf("使用MTU值: %d", optimalMTU)
+
 	// 创建WireGuard设备
-	wgDevice, err := wireguard.NewWireGuardDevice(config, false)
+	wgDevice, err := wireguard.NewWireGuardDevice(config, false, optimalMTU)
 	if err != nil {
 		log.Fatalf("创建WireGuard设备失败: %v", err)
 	}
@@ -226,6 +231,31 @@ func main() {
 		// 等待一段时间让VPN连接稳定
 		time.Sleep(5 * time.Second)
 		testInternetConnection()
+	}()
+
+	// 定期重新探测MTU值
+	go func() {
+		// 记录当前MTU值
+		currentMTU := detectOptimalMTU()
+
+		for {
+			// 每30分钟探测一次
+			time.Sleep(30 * time.Minute)
+
+			// 重新探测MTU值
+			newMTU := detectOptimalMTU()
+			if newMTU != currentMTU {
+				log.Printf("网络环境变化，MTU值从%d调整为%d", currentMTU, newMTU)
+
+				// 更新MTU值
+				err := updateMTU(wgDevice.TunName, newMTU)
+				if err != nil {
+					log.Printf("更新MTU值失败: %v", err)
+				} else {
+					currentMTU = newMTU
+				}
+			}
+		}
 	}()
 
 	// 等待信号
@@ -731,8 +761,8 @@ func generateNewConfig(endpoint, clientIPStr string) (*wireguard.Config, error) 
 
 // configureTunIP 配置TUN设备IP地址
 func configureTunIP(tunName string, ip net.IP, ipNet *net.IPNet) error {
-	// 设置一个适合VPN的MTU值
-	mtu := 1380 // 使用更保守的MTU值
+	// MTU值已经在创建TUN设备时设置
+	// 这里只需要设置IP地址
 
 	// 根据操作系统配置IP地址和MTU
 	switch runtime.GOOS {
@@ -744,9 +774,8 @@ func configureTunIP(tunName string, ip net.IP, ipNet *net.IPNet) error {
 			return fmt.Errorf("配置IP地址失败: %v", err)
 		}
 
-		// 设置MTU值
-		cmd = fmt.Sprintf("ip link set dev %s mtu %d", tunName, mtu)
-		_, _ = runCommand(cmd)
+		// MTU值已经在创建TUN设备时设置
+		// 不需要再次设置MTU
 
 		// 启用设备
 		cmd = fmt.Sprintf("ip link set dev %s up", tunName)
@@ -765,9 +794,8 @@ func configureTunIP(tunName string, ip net.IP, ipNet *net.IPNet) error {
 			return fmt.Errorf("配置IP地址失败: %v", err)
 		}
 
-		// 设置MTU值
-		cmd = fmt.Sprintf("ifconfig %s mtu %d", tunName, mtu)
-		_, _ = runCommand(cmd)
+		// MTU值已经在创建TUN设备时设置
+		// 不需要再次设置MTU
 
 		return nil
 
@@ -822,13 +850,8 @@ func configureTunIP(tunName string, ip net.IP, ipNet *net.IPNet) error {
 			}
 		}
 
-		// 设置MTU值
-		cmd = fmt.Sprintf("netsh interface ipv4 set subinterface \"%s\" mtu=%d store=persistent", tunName, mtu)
-		_, _ = runCommand(cmd)
-
-		// 使用PowerShell设置MTU值（备用方法）
-		cmd = fmt.Sprintf("Set-NetIPInterface -InterfaceAlias '%s' -NlMtuBytes %d -ErrorAction SilentlyContinue", tunName, mtu)
-		_, _ = runCommand(cmd)
+		// MTU值已经在创建TUN设备时设置
+		// 不需要再次设置MTU
 		return nil
 
 	default:
@@ -1100,6 +1123,78 @@ func truncateOutput(output string, maxLines int) string {
 	}
 
 	return strings.Join(lines[:maxLines], "\n") + "\n... (输出已截断)"
+}
+
+// detectOptimalMTU 探测最佳MTU值
+func detectOptimalMTU() int {
+	// 默认MTU值
+	defaultMTU := 1380
+
+	// 如果用户指定了MTU值，直接使用
+	if *mtuValue > 0 {
+		log.Printf("使用用户指定的MTU值: %d", *mtuValue)
+		return *mtuValue
+	}
+
+	// 如果不是Windows系统，直接返回默认值
+	if runtime.GOOS != "windows" {
+		return defaultMTU
+	}
+
+	log.Printf("正在探测最佳MTU值...")
+
+	// 尝试的MTU值范围
+	minMTU := 1280 // 最小MTU值
+	maxMTU := 1500 // 最大MTU值
+
+	// 目标服务器，使用百度或谷歌的服务器
+	targets := []string{"www.baidu.com", "www.qq.com", "8.8.8.8"}
+
+	// 从大到小尝试不同的MTU值
+	for mtu := maxMTU; mtu >= minMTU; mtu -= 10 {
+		// 对每个目标服务器进行测试
+		for _, target := range targets {
+			// 使用ping命令测试指定MTU值
+			cmd := fmt.Sprintf("ping -n 1 -w 1000 -l %d -f %s", mtu-28, target) // 减去IP和ICMP头部大小
+			_, err := runCommand(cmd)
+			if err == nil {
+				// 找到可用的MTU值，加上一些余量
+				optimalMTU := mtu - 80 // 减去WireGuard头部和一些余量
+				log.Printf("探测到最佳MTU值: %d (目标: %s, 原始MTU: %d)", optimalMTU, target, mtu)
+				return optimalMTU
+			}
+		}
+	}
+
+	// 如果探测失败，返回默认值
+	log.Printf("MTU探测失败，使用默认值: %d", defaultMTU)
+	return defaultMTU
+}
+
+// updateMTU 更新TUN设备的MTU值
+func updateMTU(tunName string, mtu int) error {
+	if runtime.GOOS != "windows" {
+		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+
+	log.Printf("正在更新TUN设备%s的MTU值为%d...", tunName, mtu)
+
+	// 使用netsh命令设置MTU值
+	cmd := fmt.Sprintf("netsh interface ipv4 set subinterface \"%s\" mtu=%d store=persistent", tunName, mtu)
+	_, err := runCommand(cmd)
+	if err != nil {
+		log.Printf("使用netsh设置MTU失败: %v", err)
+
+		// 尝试使用PowerShell设置MTU
+		cmd = fmt.Sprintf("Set-NetIPInterface -InterfaceAlias '%s' -NlMtuBytes %d -ErrorAction SilentlyContinue", tunName, mtu)
+		_, err = runCommand(cmd)
+		if err != nil {
+			return fmt.Errorf("设置MTU失败: %v", err)
+		}
+	}
+
+	log.Printf("已更新TUN设备%s的MTU值为%d", tunName, mtu)
+	return nil
 }
 
 // getDefaultGateway 获取默认网关
@@ -1915,45 +2010,38 @@ func restartNetworkAdapters() bool {
 
 	log.Printf("正在重启网络适配器...")
 
-	// 获取物理网络适配器
-	cmd := "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*' -and $_.InterfaceDescription -notlike '*TAP-Windows*'} | Select-Object -ExpandProperty Name"
-	output, err := runCommand(cmd)
-	if err != nil {
-		log.Printf("获取网络适配器失败: %v", err)
-		return false
-	}
+	// 获取默认网络适配器
+	defaultAdapter, err := getDefaultNetworkAdapter()
+	if err != nil || defaultAdapter == "" {
+		log.Printf("获取默认网络适配器失败: %v", err)
 
-	adapters := strings.Split(strings.TrimSpace(output), "\n")
-	if len(adapters) == 0 || (len(adapters) == 1 && adapters[0] == "") {
-		log.Printf("未找到物理网络适配器")
-		return false
-	}
+		// 如果无法获取默认适配器，尝试获取所有物理适配器
+		cmd := "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*' -and $_.InterfaceDescription -notlike '*TAP-Windows*'} | Select-Object -ExpandProperty Name"
+		output, err := runCommand(cmd)
+		if err != nil {
+			log.Printf("获取网络适配器失败: %v", err)
+			return false
+		}
 
-	log.Printf("找到%d个网络适配器", len(adapters))
+		adapters := strings.Split(strings.TrimSpace(output), "\n")
+		if len(adapters) == 0 || (len(adapters) == 1 && adapters[0] == "") {
+			log.Printf("未找到物理网络适配器")
+			return false
+		}
 
-	// 重新启用物理网络适配器
-	for _, adapter := range adapters {
-		adapter = strings.TrimSpace(adapter)
-		if adapter != "" {
-			log.Printf("正在重启网络适配器: %s", adapter)
-			cmd = fmt.Sprintf("Restart-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
-			restartOutput, restartErr := runCommand(cmd)
-			if restartErr != nil {
-				log.Printf("重启网络适配器失败: %s, 错误: %v, 输出: %s", adapter, restartErr, truncateOutput(restartOutput, 5))
+		log.Printf("找到%d个网络适配器", len(adapters))
 
-				// 尝试使用禁用/启用的方式
-				log.Printf("尝试禁用然后启用网络适配器: %s", adapter)
-				cmd = fmt.Sprintf("Disable-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
-				_, _ = runCommand(cmd)
-				time.Sleep(2 * time.Second)
-
-				cmd = fmt.Sprintf("Enable-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
-				_, _ = runCommand(cmd)
-				log.Printf("已禁用然后启用网络适配器: %s", adapter)
-			} else {
-				log.Printf("已重启网络适配器: %s", adapter)
+		// 重新启用物理网络适配器
+		for _, adapter := range adapters {
+			adapter = strings.TrimSpace(adapter)
+			if adapter != "" {
+				restartSingleAdapter(adapter)
 			}
 		}
+	} else {
+		// 只重启默认网络适配器
+		log.Printf("只重启默认网络适配器: %s", defaultAdapter)
+		restartSingleAdapter(defaultAdapter)
 	}
 
 	// 等待网络适配器重启
@@ -1969,6 +2057,52 @@ func restartNetworkAdapters() bool {
 		log.Printf("网络连接验证失败")
 		return false
 	}
+}
+
+// restartSingleAdapter 重启单个网络适配器
+func restartSingleAdapter(adapter string) {
+	log.Printf("正在重启网络适配器: %s", adapter)
+	cmd := fmt.Sprintf("Restart-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
+	restartOutput, restartErr := runCommand(cmd)
+	if restartErr != nil {
+		log.Printf("重启网络适配器失败: %s, 错误: %v, 输出: %s", adapter, restartErr, truncateOutput(restartOutput, 5))
+
+		// 尝试使用禁用/启用的方式
+		log.Printf("尝试禁用然后启用网络适配器: %s", adapter)
+		cmd = fmt.Sprintf("Disable-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
+		_, _ = runCommand(cmd)
+		time.Sleep(2 * time.Second)
+
+		cmd = fmt.Sprintf("Enable-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
+		_, _ = runCommand(cmd)
+		log.Printf("已禁用然后启用网络适配器: %s", adapter)
+	} else {
+		log.Printf("已重启网络适配器: %s", adapter)
+	}
+}
+
+// getDefaultNetworkAdapter 获取默认网络适配器
+func getDefaultNetworkAdapter() (string, error) {
+	// 获取默认网关
+	defaultGateway, err := getDefaultGateway()
+	if err != nil || defaultGateway == "" {
+		return "", fmt.Errorf("获取默认网关失败: %v", err)
+	}
+
+	// 获取与默认网关关联的网络适配器
+	cmd := fmt.Sprintf("Get-NetRoute | Where-Object {$_.NextHop -eq '%s'} | Select-Object -ExpandProperty InterfaceAlias -Unique", defaultGateway)
+	output, err := runCommand(cmd)
+	if err != nil {
+		return "", fmt.Errorf("获取默认网络适配器失败: %v", err)
+	}
+
+	// 取第一个适配器
+	adapters := strings.Split(strings.TrimSpace(output), "\n")
+	if len(adapters) == 0 || (len(adapters) == 1 && adapters[0] == "") {
+		return "", fmt.Errorf("未找到与默认网关关联的网络适配器")
+	}
+
+	return strings.TrimSpace(adapters[0]), nil
 }
 
 // resetNetworkStack 重置网络协议栈
