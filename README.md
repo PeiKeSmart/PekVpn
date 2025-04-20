@@ -179,6 +179,8 @@ pekclient.exe -server <服务器地址:端口>
 - `-client-name <名称>`: 指定客户端名称
 - `-config <文件路径>`: 指定配置文件路径（可选）
 - `-full-tunnel`: 启用全局代理模式，默认为 true
+- `-protect-webrtc`: 启用 WebRTC 泄露防护，防止真实 IP 地址泄露
+- `-dns-proxy`: 启用 DNS 代理，防止 DNS 泄露
 - `-amnezia`: 启用 AmneziaWG 特殊修改
 
 ## 常见问题
@@ -291,6 +293,12 @@ sudo ./pekclient -server <服务器IP>:23456 -protect-webrtc=true
 # Windows
 pekclient.exe -server <服务器IP>:23456 -protect-webrtc=true
 ```
+
+WebRTC 泄露防护功能包括：
+
+1. **防火墙规则防护**：自动添加防火墙规则，阻止 STUN/TURN 请求
+2. **浏览器配置建议**：提供浏览器配置指南，帮助用户完全禁用 WebRTC
+3. **STUN 服务器阻止**：在 hosts 文件中添加常见 STUN 服务器条目，阻止连接
 
 ### 场景四：自定义超时清理时间
 

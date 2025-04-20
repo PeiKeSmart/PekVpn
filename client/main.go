@@ -36,6 +36,7 @@ var (
 	fullTunnel     = flag.Bool("full-tunnel", true, "是否启用全局代理模式")
 	useDNSProxy    = flag.Bool("dns-proxy", false, "是否使用DNS代理")
 	mtuValue       = flag.Int("mtu", 0, "MTU值，0表示自动探测")
+	protectWebRTC  = flag.Bool("protect-webrtc", false, "是否启用WebRTC泄露防护")
 
 	// 系统信息
 	hostname, _ = os.Hostname()
@@ -246,6 +247,15 @@ func main() {
 		// 实施反检测措施
 		time.Sleep(1 * time.Second)
 		implementAntiDetectionMeasures()
+
+		// 如果启用了WebRTC泄露防护，启用它
+		if *protectWebRTC {
+			webRTCProtection := NewWebRTCProtection()
+			err := webRTCProtection.Enable()
+			if err != nil {
+				log.Printf("\u542f\u7528WebRTC\u6cc4\u9732\u9632\u62a4\u5931\u8d25: %v", err)
+			}
+		}
 	}()
 
 	// 启动连接监控和自动重连
@@ -415,7 +425,21 @@ func main() {
 		antiDetectionEnabled = false
 	}
 
-	// 7. 测试网络连接是否恢复
+	// 7. 禁用WebRTC泄露防护
+	if *protectWebRTC {
+		log.Printf("正在禁用WebRTC泄露防护...")
+		webRTCProtection := NewWebRTCProtection()
+		if webRTCProtection.IsEnabled() {
+			err := webRTCProtection.Disable()
+			if err != nil {
+				log.Printf("禁用WebRTC泄露防护失败: %v", err)
+			} else {
+				log.Printf("已禁用WebRTC泄露防护")
+			}
+		}
+	}
+
+	// 8. 测试网络连接是否恢复
 	go func() {
 		time.Sleep(2 * time.Second)
 		testNetworkAfterClose()
