@@ -86,7 +86,7 @@ pause
 ```batch
 @echo off
 echo 正在启动 PekHight VPN 客户端...
-pekclient.exe -server 120.79.187.148:23456
+pekclient.exe -server 172.16.8.10:23456
 pause
 ```
 
@@ -169,7 +169,7 @@ pekclient.exe -server <服务器地址:端口>
 
 客户端参数说明：
 
-- `-server <地址:端口>`: 指定服务器地址和端口，默认为 120.79.187.148:23456
+- `-server <地址:端口>`: 指定服务器地址和端口，默认为 172.16.8.10:23456
 - `-ip <IP地址>`: 指定客户端 IP 地址，默认为 10.9.0.2/24
 - `-tun <设备名>`: 指定 TUN 设备名称，默认为 wgc0
 - `-listen-port <端口>`: 指定客户端监听端口，默认为 51821
@@ -202,6 +202,60 @@ copy "C:\Program Files\WireGuard\wintun.dll" .
 - 检查服务器是否启动并监听正确的端口
 - 检查防火墙是否允许 WireGuard 端口的 UDP 流量
 - 使用 `-server-pubkey` 参数手动指定服务器公钥
+
+### 获取和使用服务器公钥
+
+当需要手动指定服务器公钥时，可以按照以下步骤操作：
+
+1. **获取服务器公钥**：
+   - 从服务器启动日志中获取，日志中会显示“服务器公钥: XXX=”
+
+   ```text
+   WireGuard服务器已启动
+   服务器: 0.0.0.0:23456
+   服务器公钥: AbCdEfGhIjKlMnOpQrStUvWxYz1234567890AbCd=
+   ```
+
+   - 或者使用命令生成公钥（如果您有服务器的私钥）：
+
+   ```bash
+   # Linux/macOS
+   wg pubkey < server_private.key
+
+   # Windows (PowerShell)
+   Get-Content server_private.key | wg pubkey
+   ```
+
+   - 从服务器配置文件中获取（如果有）：
+
+   ```bash
+   cat wg-server.conf
+   ```
+
+2. **在客户端中使用**：
+   ```bash
+   # Windows
+   pekclient.exe -server <服务器IP>:23456 -server-pubkey AbCdEfGhIjKlMnOpQrStUvWxYz1234567890AbCd=
+
+   # Linux/macOS
+   sudo ./pekclient -server <服务器IP>:23456 -server-pubkey AbCdEfGhIjKlMnOpQrStUvWxYz1234567890AbCd=
+   ```
+
+3. **验证连接**：
+   连接建立后，可以使用以下命令验证是否使用了正确的服务器公钥：
+   ```bash
+   # Windows
+   wg show
+
+   # Linux/macOS
+   sudo wg show
+   ```
+   输出中应该包含服务器的公钥信息。
+
+4. **为什么需要手动指定服务器公钥？**
+   - 当服务器禁用自动注册功能时，客户端必须提供服务器公钥
+   - 手动指定公钥可以防止中间人攻击，提高安全性
+   - 在某些特殊网络环境中，自动注册可能不可用
 
 ### 自动注册失败
 
