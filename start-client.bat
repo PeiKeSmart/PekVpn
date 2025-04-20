@@ -18,7 +18,10 @@ timeout /t 2 > nul
 
 REM 启动客户端
 echo 正在启动WireGuard客户端...
-start /b wgclient.exe -server 127.0.0.1:51820 -listen-port 51821
+
+REM 使用自动注册功能
+echo 使用自动注册功能连接到服务器...
+start /b wgclient.exe -server 127.0.0.1:23456 -reg-secret vpnsecret
 
 echo 客户端已启动，请查看客户端窗口获取详细信息
 timeout /t 3 > nul

@@ -54,6 +54,17 @@ func NewServerConfig(listenPort int) (*Config, error) {
 	}, nil
 }
 
+// NewServerConfigWithKey 使用现有私钥创建服务端配置
+func NewServerConfigWithKey(listenPort int, privateKey wgtypes.Key) (*Config, error) {
+	publicKey := GeneratePublicKey(privateKey)
+
+	return &Config{
+		PrivateKey: privateKey,
+		PublicKey:  publicKey,
+		ListenPort: listenPort,
+	}, nil
+}
+
 // NewClientConfig 创建客户端配置
 func NewClientConfig(serverPublicKey wgtypes.Key, serverEndpoint string, allowedIPs []net.IPNet) (*Config, error) {
 	privateKey, err := GeneratePrivateKey()

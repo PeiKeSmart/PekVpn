@@ -1,135 +1,190 @@
-# PekHightVPN
+# PekHight VPN
 
-一个使用Golang实现的VPN服务端和客户端，支持WireGuard协议和AmneziaWG。
+基于 WireGuard 协议的高性能 VPN 解决方案，支持客户端自动注册和动态配置。
 
 ## 功能特点
 
-- 基于TUN设备的VPN实现
-- 支持WireGuard协议
-- 支持AmneziaWG修改版
-- 安全的加密通信
-- 支持Windows、Linux和macOS
+- [x] 基于 WireGuard 协议的安全连接
+- [x] 支持客户端自动注册
+- [x] 支持全局代理和分流模式
+- [x] 跨平台支持 (Windows, Linux, macOS)
+- [x] 支持自定义 TUN/TAP 设备配置
+- [x] 支持 IP 转发和 NAT
+- [x] 服务器端支持多客户端管理
+- [x] 支持密钥自动生成和管理
 
-## 依赖项
+## 系统要求
 
-- Go 1.21或更高版本
-- [github.com/songgao/water](https://github.com/songgao/water) - TUN/TAP设备库
-- [golang.zx2c4.com/wireguard](https://git.zx2c4.com/wireguard-go) - WireGuard实现
-- [golang.zx2c4.com/wireguard/wgctrl](https://git.zx2c4.com/wireguard-go) - WireGuard控制库
-- 管理员/root权限（用于创建和配置TUN设备）
+- Go 1.18 或更高版本
+- WireGuard 内核模块（Linux）或 WireGuard 应用程序（Windows, macOS）
+- Windows 平台需要 wintun.dll 驱动
+- 管理员/root 权限（用于创建 TUN/TAP 设备）
 
-## 安装
+## 安装和配置
+
+### 安装 Go 环境
+
+请访问 [Go 官方网站](https://golang.org/dl/) 下载并安装 Go 环境。
+
+### 获取源代码
 
 ```bash
-# 克隆仓库
-git clone https://github.com/yourusername/pekhightvpn.git
+git clone https://github.com/pekhightvpn/pekhightvpn.git
 cd pekhightvpn
+```
 
-# 安装依赖
+### 安装依赖
+
+```bash
 go mod download
 ```
 
-## 编译
+### Windows 平台特殊要求
 
-```bash
-# 编译服务端
-go build -o wgserver ./server
+Windows 平台需要 wintun.dll 驱动，可以从以下位置下载：
 
-# 编译客户端
-go build -o wgclient ./client
-```
+1. WireGuard 官方网站: https://www.wireguard.com/install/
+2. 下载安装 WireGuard 后，将 wintun.dll 复制到 PekHight VPN 目录下
 
 ## 使用方法
 
-### 服务端
+### 服务器端
+
+服务器需要以管理员/root 权限运行：
 
 ```bash
-# 使用默认配置启动服务端
-sudo ./wgserver
+# Linux/macOS
+cd server
+sudo go run main.go -port 23456 -enable-reg
 
-# 自定义配置
-sudo ./wgserver -port 51820 -tun wg0 -ip 10.8.0.1/24 -config wg-server.conf
-
-# 使用AmneziaWG修改
-sudo ./wgserver -amnezia
+# Windows (管理员权限)
+cd server
+go run main.go -port 23456 -enable-reg
 ```
 
-参数说明：
+服务器端参数说明：
 
-- `-port`: WireGuard监听端口，默认为`51820`
-- `-tun`: TUN设备名称，默认为`wg0`
-- `-ip`: TUN设备IP地址，默认为`10.8.0.1/24`
-- `-config`: WireGuard配置文件路径，默认为`wg-server.conf`
-- `-amnezia`: 是否使用AmneziaWG修改，默认为`false`
+- `-port <端口>`: 指定 WireGuard 监听端口，默认为 23456
+- `-ip <IP地址>`: 指定 TUN 设备 IP 地址，默认为 10.8.0.1/24
+- `-tun <设备名>`: 指定 TUN 设备名称，默认为 wg0
+- `-config <文件路径>`: 指定配置文件路径，默认为 wg-server.conf
+- `-enable-reg`: 启用客户端自动注册，默认为 true
+- `-reg-secret <密钥>`: 指定客户端注册密钥，默认为 vpnsecret
+- `-client-pubkey <公钥>`: 指定特定客户端公钥（当禁用自动注册时）
+- `-amnezia`: 启用 AmneziaWG 特殊修改
 
 ### 客户端
 
+客户端需要以管理员/root 权限运行：
+
 ```bash
-# 生成新的客户端配置
-sudo ./wgclient -server 服务器IP:51820 -ip 10.8.0.2/24
+# Linux/macOS
+cd client
+sudo go run main.go -server <服务器地址:端口>
 
-# 使用现有配置文件
-sudo ./wgclient -config wg-client.conf
-
-# 使用密钥
-sudo ./wgclient -server 服务器IP:51820 -ip 10.8.0.2/24 -server-pubkey 服务器公钥 -private-key 客户端私钥
-
-# 使用AmneziaWG修改
-sudo ./wgclient -amnezia -config wg-client.conf
+# Windows (管理员权限)
+cd client
+go run main.go -server <服务器地址:端口>
 ```
 
-参数说明：
+客户端参数说明：
 
-- `-server`: 服务器地址，格式为`IP:端口`
-- `-tun`: TUN设备名称，默认为`wg0`
-- `-ip`: 客户端IP地址，默认为`10.8.0.2/24`
-- `-config`: WireGuard配置文件路径
-- `-server-pubkey`: 服务器公钥
-- `-private-key`: 客户端私钥
-- `-amnezia`: 是否使用AmneziaWG修改，默认为`false`
+- `-server <地址:端口>`: 指定服务器地址和端口，默认为 120.79.187.148:23456
+- `-ip <IP地址>`: 指定客户端 IP 地址，默认为 10.9.0.2/24
+- `-tun <设备名>`: 指定 TUN 设备名称，默认为 wgc0
+- `-listen-port <端口>`: 指定客户端监听端口，默认为 51821
+- `-private-key <私钥>`: 指定客户端私钥（可选）
+- `-server-pubkey <公钥>`: 指定服务器公钥（可选）
+- `-reg-secret <密钥>`: 指定注册密钥，默认为 vpnsecret
+- `-client-name <名称>`: 指定客户端名称
+- `-config <文件路径>`: 指定配置文件路径（可选）
+- `-full-tunnel`: 启用全局代理模式，默认为 true
+- `-amnezia`: 启用 AmneziaWG 特殊修改
 
-## Windows上的使用方法
+## 常见问题
 
-在Windows上使用本VPN需要Wintun驱动，有以下两种方式获取驱动：
+### 创建 TUN 设备失败
 
-1. **下载Wintun驱动**：
-   - 从[Wintun官网](https://www.wintun.net/)下载驱动
-   - 解压后将相应架构的`wintun.dll`文件放在程序目录下
+- 确保以管理员/root 权限运行程序
+- Windows 平台确保 wintun.dll 位于程序目录或系统路径中
+- 检查是否已安装 WireGuard 驱动
 
-2. **安装WireGuard客户端**：
-   - 从[WireGuard官网](https://www.wireguard.com/install/)下载并安装WireGuard客户端
-   - 安装后会自动安装Wintun驱动
+```bash
+# Windows
+# 将 wintun.dll 复制到程序目录
+copy "C:\Program Files\WireGuard\wintun.dll" .
+```
 
-安装驱动后，使用非常简单：
+### 无法连接到服务器
 
-1. **以管理员身份运行**：
-   - 右键点击命令提示符或PowerShell图标，选择"以管理员身份运行"
+- 检查服务器是否启动并监听正确的端口
+- 检查防火墙是否允许 WireGuard 端口的 UDP 流量
+- 使用 `-server-pubkey` 参数手动指定服务器公钥
 
-2. **运行服务端或客户端**：
+### 自动注册失败
 
-   ```powershell
-   .\wgserver.exe
-   ```
+- 检查服务器是否启用了自动注册功能 (`-enable-reg`)
+- 检查注册密钥是否一致 (`-reg-secret`)
+- 检查服务器注册服务端口（WireGuard 端口 + 1）是否可达
 
-   或
+### 无法路由流量
 
-   ```powershell
-   .\wgclient.exe -server 服务器IP:51820
-   ```
+- 检查 AllowedIPs 设置
+- 确保服务器开启了 IP 转发功能
+- 检查服务器 NAT 配置是否正确
 
-我们的实现使用纯 Go 语言的 WireGuard 实现（wireguard-go），它在用户空间运行，不需要安装额外的驱动程序。这使得安装和使用过程非常简单。
+## 完整使用场景
 
-## 注意事项
+### 场景一：快速启动服务器和客户端
 
-1. 需要管理员/root权限才能创建和配置TUN设备
-2. 我们使用纯Go语言的WireGuard实现，不需要安装额外的驱动程序
-3. 生成的客户端配置文件包含敏感信息，请妥善保管
-4. 此VPN实现仅用于学习和测试，不建议用于生产环境
+1. 启动服务器：
 
-## 关于AmneziaWG
+```bash
+cd server
+sudo go run main.go
+```
 
-AmneziaWG是WireGuard的一个修改版本，具有一些特定的变化。本实现包含了对AmneziaWG的基本支持，可以通过`-amnezia`参数启用。
+2. 启动客户端：
 
-## 许可证
+```bash
+cd client
+sudo go run main.go -server <服务器IP>:23456
+```
 
-MIT
+### 场景二：使用指定密钥
+
+1. 启动服务器：
+
+```bash
+cd server
+sudo go run main.go -enable-reg=false -client-pubkey <客户端公钥>
+```
+
+2. 启动客户端：
+
+```bash
+cd client
+sudo go run main.go -server <服务器IP>:23456 -private-key <客户端私钥> -server-pubkey <服务器公钥>
+```
+
+## 任务清单
+
+- [x] 服务器端基本功能实现
+- [x] 客户端基本功能实现
+- [x] 客户端自动注册机制
+- [x] 支持全局代理和分流模式
+- [x] 跨平台支持优化
+- [ ] Web 管理界面
+- [ ] 客户端状态监控
+- [ ] 连接统计和日志分析
+- [ ] 用户认证管理
+- [ ] 带宽控制和流量管理
+
+## 开发计划
+
+- [ ] 支持多个 VPN 隧道
+- [ ] 动态 IP 分配和回收机制优化
+- [ ] 服务端高可用方案
+- [ ] 支持 DNS 配置和泄漏防护
+- [ ] 增加移动端客户端
+- [ ] 支持 WebRTC 穿透

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -18,6 +19,7 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
+// ERR_ADDRESS_UNREACHABLE
 var (
 	serverEndpoint = flag.String("server", "120.79.187.148:23456", "服务器地址")
 	tunName        = flag.String("tun", "wgc0", "TUN设备名称") // 使用不同的设备名称
@@ -27,6 +29,12 @@ var (
 	clientIP       = flag.String("ip", "10.9.0.2/24", "客户端IP地址") // 使用不同的IP地址范围
 	listenPort     = flag.Int("listen-port", 51821, "客户端监听端口")   // 使用不同的监听端口
 	useAmnezia     = flag.Bool("amnezia", false, "是否使用AmneziaWG修改")
+	clientName     = flag.String("client-name", "", "客户端名称")
+	regSecret      = flag.String("reg-secret", "vpnsecret", "注册密钥")
+	fullTunnel     = flag.Bool("full-tunnel", true, "是否启用全局代理模式")
+
+	// 系统信息
+	hostname, _ = os.Hostname()
 )
 
 func main() {
@@ -199,21 +207,240 @@ func createConfigFromKeys(serverPubKeyStr, privateKeyStr, endpoint, clientIPStr 
 		return nil, fmt.Errorf("解析服务器公钥失败: %v", err)
 	}
 
-	// 解析允许的IP - 使用与服务端不同的网段
-	_, allowedIP, err := net.ParseCIDR("10.9.0.0/24")
-	if err != nil {
-		return nil, fmt.Errorf("解析允许的IP失败: %v", err)
+	// 根据用户选择的代理模式设置允许的IP
+	var allowedIP *net.IPNet
+	var parseErr error
+	if *fullTunnel {
+		// 全局代理模式
+		_, allowedIP, parseErr = net.ParseCIDR("0.0.0.0/0")
+		log.Printf("使用全局代理模式，所有流量将通过VPN")
+	} else {
+		// 分流模式，只允许VPN网段的流量
+		_, allowedIP, parseErr = net.ParseCIDR("10.9.0.0/24")
+		log.Printf("使用分流模式，只允许VPN网段的流量")
+	}
+
+	if parseErr != nil {
+		return nil, fmt.Errorf("解析允许的IP失败: %v", parseErr)
 	}
 
 	// 创建配置
 	config := &wireguard.Config{
-		PrivateKey: privateKey,
-		PublicKey:  serverPubKey,
-		Endpoint:   endpoint,
-		AllowedIPs: []net.IPNet{*allowedIP},
+		PrivateKey:          privateKey,
+		PublicKey:           serverPubKey,
+		Endpoint:            endpoint,
+		AllowedIPs:          []net.IPNet{*allowedIP},
+		PersistentKeepalive: 25, // 每25秒发送一次keepalive包
 	}
 
 	return config, nil
+}
+
+// getServerPublicKey 从服务器获取公钥
+func getServerPublicKey(endpoint string) (wgtypes.Key, error) {
+	// 解析服务器地址和端口
+	host, portStr, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("解析服务器地址失败: %v", err)
+	}
+
+	// WireGuard使用UDP协议，直接尝试UDP连接
+	log.Printf("尝试使用UDP协议连接到服务器 %s...", endpoint)
+
+	// 如果用户指定了服务器公钥，直接返回
+	if *serverPubKey != "" {
+		log.Printf("使用用户指定的服务器公钥: %s", *serverPubKey)
+		key, err := wireguard.ParseKey(*serverPubKey)
+		if err != nil {
+			return wgtypes.Key{}, fmt.Errorf("解析服务器公钥失败: %v", err)
+		}
+		return key, nil
+	}
+
+	// 解析服务器地址
+	udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("解析服务器UDP地址失败: %v", err)
+	}
+
+	// 尝试连接
+	udpConn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("无法连接到服务器UDP端口: %v", err)
+	}
+
+	// 设置超时
+	udpConn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// 发送测试数据
+	_, err = udpConn.Write([]byte("WireGuard Test"))
+	if err != nil {
+		udpConn.Close()
+		return wgtypes.Key{}, fmt.Errorf("发送测试数据失败: %v", err)
+	}
+
+	// 关闭连接
+	udpConn.Close()
+	log.Printf("成功连接到服务器UDP端口")
+
+	// 如果服务器在本地运行，尝试从配置文件获取公钥
+	if host == "127.0.0.1" || host == "localhost" {
+		// 尝试读取服务器配置文件
+		configFile := "wg-server.conf"
+		data, err := os.ReadFile(configFile)
+		if err == nil {
+			// 解析配置文件中的公钥
+			content := string(data)
+			lines := strings.Split(content, "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "PublicKey=") || strings.HasPrefix(line, "PublicKey =") {
+					pubKeyStr := strings.TrimPrefix(line, "PublicKey=")
+					pubKeyStr = strings.TrimPrefix(pubKeyStr, "PublicKey =")
+					pubKeyStr = strings.TrimSpace(pubKeyStr)
+					pubKey, err := wireguard.ParseKey(pubKeyStr)
+					if err == nil {
+						log.Printf("从配置文件获取到服务器公钥: %s", pubKey.String())
+						return pubKey, nil
+					}
+				}
+			}
+		}
+	}
+
+	// 尝试从注册服务获取服务器公钥
+	regPort, _ := strconv.Atoi(portStr)
+	regPort++ // 注册服务端口 = WireGuard端口 + 1
+	regEndpoint := fmt.Sprintf("%s:%d", host, regPort)
+
+	log.Printf("尝试从注册服务获取服务器公钥: %s", regEndpoint)
+
+	// 解析服务器地址
+	regAddr, err := net.ResolveUDPAddr("udp", regEndpoint)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("解析注册服务地址失败: %v", err)
+	}
+
+	// 尝试连接
+	regConn, err := net.DialUDP("udp", nil, regAddr)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("无法连接到注册服务: %v", err)
+	}
+	defer regConn.Close()
+
+	// 设置超时
+	regConn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// 发送公钥请求
+	_, err = regConn.Write([]byte("GET_PUBLIC_KEY"))
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("发送公钥请求失败: %v", err)
+	}
+
+	// 接收响应
+	buf := make([]byte, 1024)
+	n, _, err := regConn.ReadFromUDP(buf)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("接收响应失败: %v", err)
+	}
+
+	// 解析公钥
+	pubKeyStr := string(buf[:n])
+	pubKey, err := wireguard.ParseKey(pubKeyStr)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("解析服务器公钥失败: %v", err)
+	}
+
+	log.Printf("从注册服务获取到服务器公钥: %s", pubKey.String())
+	return pubKey, nil
+}
+
+// RegistrationRequest 客户端注册请求结构
+type RegistrationRequest struct {
+	Command    string `json:"command"`
+	PublicKey  string `json:"public_key"`
+	Secret     string `json:"secret"`
+	ClientName string `json:"client_name"`
+}
+
+// RegistrationResponse 客户端注册响应结构
+type RegistrationResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	IP      string `json:"ip,omitempty"`
+}
+
+// registerClientWithServer 向服务器注册客户端
+func registerClientWithServer(serverEndpoint string, clientPublicKey wgtypes.Key) (string, error) {
+	// 解析服务器地址和端口
+	host, portStr, err := net.SplitHostPort(serverEndpoint)
+	if err != nil {
+		return "", fmt.Errorf("解析服务器地址失败: %v", err)
+	}
+
+	// 注册服务端口 = WireGuard端口 + 1
+	regPort, _ := strconv.Atoi(portStr)
+	regPort++
+	regEndpoint := fmt.Sprintf("%s:%d", host, regPort)
+
+	log.Printf("尝试向注册服务注册客户端: %s", regEndpoint)
+
+	// 解析服务器地址
+	regAddr, err := net.ResolveUDPAddr("udp", regEndpoint)
+	if err != nil {
+		return "", fmt.Errorf("解析注册服务地址失败: %v", err)
+	}
+
+	// 尝试连接
+	regConn, err := net.DialUDP("udp", nil, regAddr)
+	if err != nil {
+		return "", fmt.Errorf("无法连接到注册服务: %v", err)
+	}
+	defer regConn.Close()
+
+	// 设置超时
+	regConn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// 创建注册请求
+	request := RegistrationRequest{
+		Command:    "REGISTER_CLIENT",
+		PublicKey:  clientPublicKey.String(),
+		Secret:     *regSecret,
+		ClientName: *clientName,
+	}
+
+	// 序列化请求
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		return "", fmt.Errorf("序列化请求失败: %v", err)
+	}
+
+	// 发送注册请求
+	_, err = regConn.Write(requestJSON)
+	if err != nil {
+		return "", fmt.Errorf("发送注册请求失败: %v", err)
+	}
+
+	// 接收响应
+	buf := make([]byte, 1024)
+	n, _, err := regConn.ReadFromUDP(buf)
+	if err != nil {
+		return "", fmt.Errorf("接收响应失败: %v", err)
+	}
+
+	// 解析响应
+	var response RegistrationResponse
+	if err := json.Unmarshal(buf[:n], &response); err != nil {
+		return "", fmt.Errorf("解析响应失败: %v", err)
+	}
+
+	// 检查响应
+	if !response.Success {
+		return "", fmt.Errorf("注册失败: %s", response.Message)
+	}
+
+	log.Printf("注册成功: %s", response.Message)
+	return response.IP, nil
 }
 
 // generateNewConfig 生成新的WireGuard配置
@@ -224,10 +451,21 @@ func generateNewConfig(endpoint, clientIPStr string) (*wireguard.Config, error) 
 		return nil, fmt.Errorf("生成私钥失败: %v", err)
 	}
 
-	// 解析允许的IP - 使用与服务端不同的网段
-	_, allowedIP, err := net.ParseCIDR("10.9.0.0/24")
-	if err != nil {
-		return nil, fmt.Errorf("解析允许的IP失败: %v", err)
+	// 根据用户选择的代理模式设置允许的IP
+	var allowedIP *net.IPNet
+	var parseErr error
+	if *fullTunnel {
+		// 全局代理模式
+		_, allowedIP, parseErr = net.ParseCIDR("0.0.0.0/0")
+		log.Printf("使用全局代理模式，所有流量将通过VPN")
+	} else {
+		// 分流模式，只允许VPN网段的流量
+		_, allowedIP, parseErr = net.ParseCIDR("10.9.0.0/24")
+		log.Printf("使用分流模式，只允许VPN网段的流量")
+	}
+
+	if parseErr != nil {
+		return nil, fmt.Errorf("解析允许的IP失败: %v", parseErr)
 	}
 
 	// 尝试从服务器获取公钥
@@ -270,10 +508,24 @@ func generateNewConfig(endpoint, clientIPStr string) (*wireguard.Config, error) 
 		PersistentKeepalive: 25, // 每25秒发送一次keepalive包
 	}
 
-	// 打印客户端公钥，用于添加到服务器
-	publicKey := wireguard.GeneratePublicKey(privateKey)
-	log.Printf("生成的客户端公钥: %s", publicKey.String())
-	log.Printf("请将此公钥添加到服务器配置中")
+	// 生成客户端公钥
+	clientPublicKey := wireguard.GeneratePublicKey(privateKey)
+	log.Printf("生成的客户端公钥: %s", clientPublicKey.String())
+
+	// 向服务器注册客户端
+	assignedIP, err := registerClientWithServer(endpoint, clientPublicKey)
+	if err != nil {
+		log.Printf("向服务器注册客户端失败: %v", err)
+		log.Printf("请手动将公钥添加到服务器配置中")
+	} else {
+		log.Printf("客户端已成功注册到服务器，分配IP: %s", assignedIP)
+
+		// 如果服务器分配了IP地址，使用这个IP地址
+		if assignedIP != "" {
+			*clientIP = assignedIP + "/24"
+			log.Printf("使用服务器分配的IP地址: %s", *clientIP)
+		}
+	}
 
 	return config, nil
 }
@@ -514,13 +766,14 @@ func cleanupNetworkResources() {
 			_, _ = runCommand(cmd)
 		} else {
 			// 在非Windows系统上使用原来的方法
-			if runtime.GOOS == "linux" {
+			switch runtime.GOOS {
+			case "linux":
 				cmd := fmt.Sprintf("ip addr del %s dev $(ip route | grep %s | awk '{print $3}')", ip.String(), ipNet.IP.String())
 				_, _ = runCommand(cmd)
 
 				cmd = fmt.Sprintf("ip route del %s", ipNet.String())
 				_, _ = runCommand(cmd)
-			} else if runtime.GOOS == "darwin" {
+			case "darwin":
 				cmd := fmt.Sprintf("ifconfig $(route -n get %s | grep interface | awk '{print $2}') inet %s delete", ipNet.IP.String(), ip.String())
 				_, _ = runCommand(cmd)
 
@@ -556,114 +809,6 @@ func cleanupOrphanedAdapters() {
 			_, _ = runCommand(removeCmd)
 		}
 	}
-}
-
-// getServerPublicKey 从服务器获取公钥
-func getServerPublicKey(endpoint string) (wgtypes.Key, error) {
-	// 解析服务器地址和端口
-	host, portStr, err := net.SplitHostPort(endpoint)
-	if err != nil {
-		return wgtypes.Key{}, fmt.Errorf("解析服务器地址失败: %v", err)
-	}
-
-	// WireGuard使用UDP协议，直接尝试UDP连接
-	log.Printf("尝试使用UDP协议连接到服务器 %s...", endpoint)
-
-	// 如果用户指定了服务器公钥，直接返回
-	if *serverPubKey != "" {
-		log.Printf("使用用户指定的服务器公钥: %s", *serverPubKey)
-		key, err := wireguard.ParseKey(*serverPubKey)
-		if err != nil {
-			return wgtypes.Key{}, fmt.Errorf("解析服务器公钥失败: %v", err)
-		}
-		return key, nil
-	}
-
-	// 解析服务器地址
-	udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
-	if err != nil {
-		return wgtypes.Key{}, fmt.Errorf("解析服务器UDP地址失败: %v", err)
-	}
-
-	// 尝试连接
-	udpConn, err := net.DialUDP("udp", nil, udpAddr)
-	if err != nil {
-		return wgtypes.Key{}, fmt.Errorf("无法连接到服务器UDP端口: %v", err)
-	}
-
-	// 设置超时
-	udpConn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	// 发送测试数据
-	_, err = udpConn.Write([]byte("WireGuard Test"))
-	if err != nil {
-		udpConn.Close()
-		return wgtypes.Key{}, fmt.Errorf("发送测试数据失败: %v", err)
-	}
-
-	// 关闭连接
-	udpConn.Close()
-	log.Printf("成功连接到服务器UDP端口")
-
-	// 如果服务器在本地运行，尝试从配置文件获取公钥
-	if host == "127.0.0.1" || host == "localhost" {
-		// 尝试读取服务器配置文件
-		configFile := "wg-server.conf"
-		data, err := os.ReadFile(configFile)
-		if err == nil {
-			// 解析配置文件中的公钥
-			content := string(data)
-			lines := strings.Split(content, "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "PublicKey=") {
-					pubKeyStr := strings.TrimPrefix(line, "PublicKey=")
-					pubKey, err := wireguard.ParseKey(pubKeyStr)
-					if err == nil {
-						log.Printf("从配置文件获取到服务器公钥: %s", pubKey.String())
-						return pubKey, nil
-					}
-				}
-			}
-		}
-	}
-
-	// 如果无法从配置文件获取，尝试使用UDP协议获取服务器公钥
-	// 注意：这只是一个简化的实现，实际上需要实现WireGuard协议的握手
-	// 这里我们只是模拟一个简单的请求
-	port, _ := strconv.Atoi(portStr)
-	addr := &net.UDPAddr{IP: net.ParseIP(host), Port: port}
-	udpConn2, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		return wgtypes.Key{}, fmt.Errorf("无法创建UDP连接: %v", err)
-	}
-	defer udpConn2.Close()
-
-	// 发送请求
-	_, err = udpConn2.Write([]byte("GET_PUBLIC_KEY"))
-	if err != nil {
-		return wgtypes.Key{}, fmt.Errorf("发送请求失败: %v", err)
-	}
-
-	// 设置超时
-	udpConn2.SetReadDeadline(time.Now().Add(2 * time.Second))
-
-	// 接收响应
-	buf := make([]byte, 1024)
-	n, _, err := udpConn2.ReadFromUDP(buf)
-	if err != nil {
-		return wgtypes.Key{}, fmt.Errorf("接收响应失败: %v", err)
-	}
-
-	// 解析公钥
-	pubKeyStr := string(buf[:n])
-	pubKey, err := wireguard.ParseKey(pubKeyStr)
-	if err != nil {
-		return wgtypes.Key{}, fmt.Errorf("解析服务器公钥失败: %v", err)
-	}
-
-	log.Printf("从服务器获取到公钥: %s", pubKey.String())
-	return pubKey, nil
 }
 
 // getTunIP 获取TUN设备的IP地址

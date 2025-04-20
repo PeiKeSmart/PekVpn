@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -19,11 +20,14 @@ import (
 )
 
 var (
-	listenPort = flag.Int("port", 23456, "WireGuard监听端口")
-	tunName    = flag.String("tun", "wg0", "TUN设备名称")
-	tunIP      = flag.String("ip", "10.8.0.1/24", "TUN设备IP地址")
-	configFile = flag.String("config", "wg-server.conf", "WireGuard配置文件路径")
-	useAmnezia = flag.Bool("amnezia", false, "是否使用AmneziaWG修改")
+	listenPort   = flag.Int("port", 23456, "WireGuard监听端口")
+	tunName      = flag.String("tun", "wg0", "TUN设备名称")
+	tunIP        = flag.String("ip", "10.8.0.1/24", "TUN设备IP地址")
+	configFile   = flag.String("config", "wg-server.conf", "WireGuard配置文件路径")
+	useAmnezia   = flag.Bool("amnezia", false, "是否使用AmneziaWG修改")
+	clientPubKey = flag.String("client-pubkey", "", "客户端公钥")
+	regEnabled   = flag.Bool("enable-reg", true, "是否启用客户端自动注册")
+	regSecret    = flag.String("reg-secret", "vpnsecret", "客户端注册密钥")
 
 	// 客户端管理
 	clients     = make(map[wgtypes.Key]*wireguard.PeerInfo)
@@ -58,10 +62,34 @@ func main() {
 		log.Fatalf("无效的IP地址: %s, %v", *tunIP, err)
 	}
 
-	// 创建WireGuard配置
-	config, err := wireguard.NewServerConfig(*listenPort)
-	if err != nil {
-		log.Fatalf("创建WireGuard配置失败: %v", err)
+	// 尝试读取现有配置
+	var config *wireguard.Config
+
+	if _, fileErr := os.Stat(*configFile); fileErr == nil {
+		// 配置文件存在，尝试读取私钥
+		privateKey, readErr := readExistingConfig(*configFile)
+		if readErr == nil {
+			log.Printf("使用现有配置文件中的密钥对")
+			// 使用现有私钥创建配置
+			config, err = wireguard.NewServerConfigWithKey(*listenPort, privateKey)
+			if err != nil {
+				log.Fatalf("使用现有密钥创建配置失败: %v", err)
+			}
+		} else {
+			log.Printf("读取现有配置文件失败: %v，将创建新的密钥对", readErr)
+			// 创建新配置
+			config, err = wireguard.NewServerConfig(*listenPort)
+			if err != nil {
+				log.Fatalf("创建服务端配置失败: %v", err)
+			}
+		}
+	} else {
+		// 配置文件不存在，创建新配置
+		log.Printf("配置文件不存在，创建新的密钥对")
+		config, err = wireguard.NewServerConfig(*listenPort)
+		if err != nil {
+			log.Fatalf("创建服务端配置失败: %v", err)
+		}
 	}
 
 	// 如果使用AmneziaWG，应用特定修改
@@ -107,8 +135,22 @@ func main() {
 		log.Printf("NAT已配置")
 	}
 
-	// 添加一个默认的客户端配置，允许任何客户端连接
-	addDefaultClient(config, wgDevice)
+	// 移除默认客户端添加代码，替换为有条件添加
+	// 只有在未启用自动注册功能时，才考虑添加指定客户端
+	if !*regEnabled {
+		if *clientPubKey != "" {
+			log.Printf("添加命令行指定的客户端公钥")
+			addSpecificClient(config, wgDevice, *clientPubKey)
+		} else {
+			log.Printf("未启用自动注册功能，也未指定客户端公钥，WireGuard服务器处于等待模式")
+		}
+	}
+
+	// 如果启用了客户端自动注册，启动注册服务
+	if *regEnabled {
+		go startClientRegistrationService(*listenPort+1, config, wgDevice)
+		log.Printf("客户端自动注册服务已启动，监听端口: %d", *listenPort+1)
+	}
 
 	// 启动客户端连接监控
 	go monitorClientConnections(wgDevice)
@@ -125,6 +167,37 @@ func main() {
 
 	// 清理NAT和路由
 	cleanupNAT(*tunIP)
+}
+
+// readExistingConfig 尝试从配置文件中读取现有的私钥和公钥
+func readExistingConfig(configFilePath string) (wgtypes.Key, error) {
+	// 检查配置文件是否存在
+	_, err := os.Stat(configFilePath)
+	if os.IsNotExist(err) {
+		return wgtypes.Key{}, fmt.Errorf("配置文件不存在")
+	}
+
+	// 读取配置文件内容
+	content, err := os.ReadFile(configFilePath)
+	if err != nil {
+		log.Printf("读取配置文件失败: %v", err)
+		return wgtypes.Key{}, err
+	}
+
+	// 解析私钥和公钥
+	contentStr := string(content)
+	lines := strings.Split(contentStr, "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "PrivateKey = ") {
+			privateKeyStr := strings.TrimPrefix(line, "PrivateKey = ")
+			// 解析私钥
+			return wgtypes.ParseKey(privateKeyStr)
+		}
+	}
+
+	return wgtypes.Key{}, fmt.Errorf("在配置文件中未找到私钥")
 }
 
 // configureTunIP 配置TUN设备IP地址
@@ -650,44 +723,35 @@ func cleanupOrphanedAdapters() {
 	}
 }
 
-// addDefaultClient 添加一个默认的客户端配置，允许任何客户端连接
-func addDefaultClient(serverConfig *wireguard.Config, wgDevice *wireguard.WireGuardDevice) {
+// addSpecificClient 添加指定公钥的客户端
+func addSpecificClient(serverConfig *wireguard.Config, wgDevice *wireguard.WireGuardDevice, clientPubKeyStr string) {
+	pubKey, err := wireguard.ParseKey(clientPubKeyStr)
+	if err != nil {
+		log.Printf("解析客户端公钥失败: %v", err)
+		return
+	}
+
 	// 创建允许的IP
 	_, allowedIP, _ := net.ParseCIDR("0.0.0.0/0")
 	allowedIPs := []net.IPNet{*allowedIP}
 
-	// 创建客户端配置 - 使用空公钥，允许任何客户端连接
+	// 创建客户端配置
 	clientConfig := &wireguard.Config{
+		PublicKey:  pubKey,
 		AllowedIPs: allowedIPs,
 	}
 
-	// 尝试解析客户端公钥
-	if *clientPubKey != "" {
-		pubKey, err := wireguard.ParseKey(*clientPubKey)
-		if err == nil {
-			clientConfig.PublicKey = pubKey
-			log.Printf("添加指定的客户端公钥: %s", pubKey.String())
-		} else {
-			log.Printf("解析客户端公钥失败: %v", err)
-		}
-	} else {
-		// 如果没有指定客户端公钥，尝试使用默认的客户端公钥
-		defaultPubKey, _ := wireguard.ParseKey("UpKZ35Hm2UWVIl6WgTO9x3oEtiWltVly8vg+BFlqBlo=")
-		clientConfig.PublicKey = defaultPubKey
-		log.Printf("添加默认客户端公钥: %s", defaultPubKey.String())
-	}
-
 	// 分配IP地址
-	clientIP := net.ParseIP("10.9.0.2")
+	clientIP := allocateIP()
 
 	// 添加客户端到WireGuard设备
-	err := wgDevice.AddPeer(clientConfig, clientIP)
+	err = wgDevice.AddPeer(clientConfig, clientIP)
 	if err != nil {
-		log.Printf("添加默认客户端失败: %v", err)
+		log.Printf("添加客户端失败: %v", err)
 		return
 	}
 
-	log.Printf("已添加默认客户端, IP: %s", clientIP.String())
+	log.Printf("已添加客户端, IP: %s, 公钥: %s", clientIP.String(), pubKey.String())
 
 	// 更新配置文件
 	clientConfigs := []*wireguard.Config{clientConfig}
@@ -870,5 +934,171 @@ func cleanupNAT(vpnNetwork string) error {
 
 	default:
 		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
+
+// startClientRegistrationService 启动客户端注册服务
+func startClientRegistrationService(port int, serverConfig *wireguard.Config, wgDevice *wireguard.WireGuardDevice) {
+	// 创建UDP地址
+	addr := net.UDPAddr{
+		Port: port,
+		IP:   net.ParseIP("0.0.0.0"),
+	}
+
+	// 创建UDP服务
+	conn, err := net.ListenUDP("udp", &addr)
+	if err != nil {
+		log.Printf("启动客户端注册服务失败: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	log.Printf("客户端注册服务已启动，等待客户端连接...")
+
+	// 接收缓冲区
+	buffer := make([]byte, 1024)
+
+	for {
+		// 接收客户端请求
+		n, clientAddr, err := conn.ReadFromUDP(buffer)
+		if err != nil {
+			log.Printf("接收数据失败: %v", err)
+			continue
+		}
+
+		// 处理客户端请求
+		go handleClientRegistration(conn, clientAddr, buffer[:n], serverConfig, wgDevice)
+	}
+}
+
+// 客户端注册请求结构
+type RegistrationRequest struct {
+	Command    string `json:"command"`
+	PublicKey  string `json:"public_key"`
+	Secret     string `json:"secret"`
+	ClientName string `json:"client_name"`
+}
+
+// 客户端注册响应结构
+type RegistrationResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	IP      string `json:"ip,omitempty"`
+}
+
+// handleClientRegistration 处理客户端注册请求
+func handleClientRegistration(conn *net.UDPConn, clientAddr *net.UDPAddr, data []byte, serverConfig *wireguard.Config, wgDevice *wireguard.WireGuardDevice) {
+	// 判断是简单的公钥请求
+	if string(data) == "GET_PUBLIC_KEY" {
+		// 返回服务器公钥
+		publicKey := wireguard.GeneratePublicKey(serverConfig.PrivateKey)
+		log.Printf("收到来自 %s 的公钥请求", clientAddr.String())
+		conn.WriteToUDP([]byte(publicKey.String()), clientAddr)
+		log.Printf("已向客户端 %s 发送服务器公钥: %s", clientAddr.String(), publicKey.String())
+		return
+	}
+
+	// 尝试解析JSON请求
+	var request RegistrationRequest
+	if err := json.Unmarshal(data, &request); err != nil {
+		log.Printf("解析客户端请求失败: %v, 数据: %s", err, string(data))
+		sendRegistrationResponse(conn, clientAddr, false, "无效的请求格式", "")
+		return
+	}
+
+	// 验证注册密钥
+	if request.Secret != *regSecret {
+		log.Printf("客户端 %s 注册失败: 无效的注册密钥", clientAddr.String())
+		sendRegistrationResponse(conn, clientAddr, false, "无效的注册密钥", "")
+		return
+	}
+
+	// 处理注册命令
+	if request.Command == "REGISTER_CLIENT" {
+		log.Printf("收到来自 %s 的客户端注册请求", clientAddr.String())
+		// 解析客户端公钥
+		clientPublicKey, err := wireguard.ParseKey(request.PublicKey)
+		if err != nil {
+			log.Printf("解析客户端公钥失败: %v", err)
+			sendRegistrationResponse(conn, clientAddr, false, "无效的公钥格式", "")
+			return
+		}
+
+		// 分配IP地址
+		clientIP := allocateIP()
+
+		// 创建允许的IP - 这里允许客户端接收更多流量
+		allowedIPs := []net.IPNet{}
+
+		// 添加客户端特定IP
+		_, ipNet, _ := net.ParseCIDR(fmt.Sprintf("%s/32", clientIP.String()))
+		allowedIPs = append(allowedIPs, *ipNet)
+
+		// 添加VPN网段，允许与其他客户端通信
+		_, vpnNet, _ := net.ParseCIDR("10.8.0.0/24")
+		allowedIPs = append(allowedIPs, *vpnNet)
+
+		log.Printf("为客户端设置的AllowedIPs: %v", allowedIPs)
+
+		// 创建客户端配置
+		clientConfig := &wireguard.Config{
+			PublicKey:  clientPublicKey,
+			AllowedIPs: allowedIPs,
+		}
+
+		// 添加客户端到WireGuard设备
+		if err := wgDevice.AddPeer(clientConfig, clientIP); err != nil {
+			log.Printf("添加客户端失败: %v", err)
+			sendRegistrationResponse(conn, clientAddr, false, "添加客户端失败", "")
+			return
+		}
+
+		// 生成客户端名称（如果未提供）
+		clientName := request.ClientName
+		if clientName == "" {
+			clientName = fmt.Sprintf("client-%s", clientAddr.IP)
+		}
+
+		log.Printf("已注册新客户端: %s, IP: %s, 公钥: %s", clientName, clientIP, request.PublicKey)
+
+		// 更新配置文件
+		clientConfigs := []*wireguard.Config{clientConfig}
+		configContent := serverConfig.GetWireGuardConfigString(true, clientConfigs)
+
+		// 添加公钥到配置文件
+		publicKey := wireguard.GeneratePublicKey(serverConfig.PrivateKey)
+		configContent = strings.Replace(configContent, "[Interface]", "[Interface]\nPublicKey = "+publicKey.String(), 1)
+
+		// 写入配置文件
+		if err := os.WriteFile(*configFile, []byte(configContent), 0600); err != nil {
+			log.Printf("更新配置文件失败: %v", err)
+		}
+
+		// 返回成功响应
+		sendRegistrationResponse(conn, clientAddr, true, "客户端注册成功", clientIP.String())
+		return
+	}
+
+	// 未知命令
+	log.Printf("收到来自 %s 的未知命令: %s", clientAddr.String(), string(data))
+	sendRegistrationResponse(conn, clientAddr, false, "未知命令", "")
+}
+
+// sendRegistrationResponse 发送注册响应
+func sendRegistrationResponse(conn *net.UDPConn, clientAddr *net.UDPAddr, success bool, message string, ip string) {
+	response := RegistrationResponse{
+		Success: success,
+		Message: message,
+		IP:      ip,
+	}
+
+	responseJSON, err := json.Marshal(response)
+	if err != nil {
+		log.Printf("序列化响应失败: %v", err)
+		return
+	}
+
+	if _, err := conn.WriteToUDP(responseJSON, clientAddr); err != nil {
+		log.Printf("发送响应失败: %v", err)
 	}
 }
