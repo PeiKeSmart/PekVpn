@@ -32,6 +32,7 @@ var (
 	clientName     = flag.String("client-name", "", "客户端名称")
 	regSecret      = flag.String("reg-secret", "vpnsecret", "注册密钥")
 	fullTunnel     = flag.Bool("full-tunnel", true, "是否启用全局代理模式")
+	useDNSProxy    = flag.Bool("dns-proxy", false, "是否使用DNS代理")
 
 	// 系统信息
 	hostname, _ = os.Hostname()
@@ -110,11 +111,79 @@ func main() {
 		log.Fatalf("配置TUN设备IP地址失败: %v", err)
 	}
 
-	// 添加路由
-	// 注意：我们只需要路由网络，不需要服务器IP
+	// 配置DNS
+	err = configureDNS(wgDevice.TunName)
+	if err != nil {
+		log.Printf("配置DNS失败: %v", err)
+	}
+
+	// TCP参数优化已禁用
+	// optimizeTCPParameters()
+
+	// 路由优化已禁用
+	// optimizeRouting(wgDevice.TunName)
+
+	// 添加路由顺序很重要，先添加服务器特殊路由，再添加VPN网段路由，最后添加默认路由
+
+	// 如果启用了全局代理，先添加服务器特殊路由，再添加默认路由
+	if *fullTunnel {
+		// 添加服务器特殊路由，确保与VPN服务器的通信不通过VPN
+		host, _, err := net.SplitHostPort(config.Endpoint)
+		if err == nil {
+			serverIP := net.ParseIP(host)
+			if serverIP != nil && !serverIP.IsLoopback() {
+				// 获取默认网关
+				defaultGateway := ""
+
+				// 使用route命令获取默认网关
+				cmd := "cmd.exe /c \"route print 0.0.0.0 | findstr 0.0.0.0 | findstr /v 127.0.0.1 | findstr /v 0.0.0.0/0\""
+				output, _ := runCommand(cmd)
+				lines := strings.Split(output, "\n")
+				for _, line := range lines {
+					fields := strings.Fields(line)
+					if len(fields) >= 3 {
+						defaultGateway = fields[2]
+						break
+					}
+				}
+
+				if defaultGateway != "" {
+					// 删除可能存在的路由
+					deleteCmd := fmt.Sprintf("route delete %s", serverIP.String())
+					_, _ = runCommand(deleteCmd)
+
+					// 添加服务器特殊路由，使用默认网关，使用非常低的metric值
+					addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask 255.255.255.255 %s metric 1\"", serverIP.String(), defaultGateway)
+					_, err = runCommand(addCmd)
+					if err == nil {
+						log.Printf("已添加服务器特殊路由: %s -> %s", serverIP.String(), defaultGateway)
+					}
+				}
+			}
+		}
+
+		// 等待一下，确保服务器特殊路由生效
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// 添加VPN网段路由
 	err = addRoute(config.AllowedIPs[0].String(), wgDevice.TunName)
 	if err != nil {
-		log.Printf("添加路由失败: %v", err)
+		log.Printf("添加VPN网段路由失败: %v", err)
+	} else {
+		log.Printf("已添加VPN网段路由: %s", config.AllowedIPs[0].String())
+	}
+
+	// 如果启用了全局代理，添加默认路由
+	if *fullTunnel {
+		// 添加默认路由
+		_, defaultNet, _ := net.ParseCIDR("0.0.0.0/0")
+		err = addRoute(defaultNet.String(), wgDevice.TunName)
+		if err != nil {
+			log.Printf("添加默认路由失败: %v", err)
+		} else {
+			log.Printf("已添加默认路由，所有流量将通过VPN（除了服务器通信）")
+		}
 	}
 
 	log.Printf("WireGuard客户端已启动")
@@ -122,6 +191,40 @@ func main() {
 	log.Printf("服务器公钥: %s", config.PublicKey.String())
 	log.Printf("客户端公钥: %s", wireguard.GeneratePublicKey(config.PrivateKey).String())
 	log.Printf("TUN设备: %s, IP: %s", wgDevice.TunName, *clientIP)
+
+	// 如果启用DNS代理，启动DNS代理
+	var dnsProxy *DNSProxy
+	if *useDNSProxy {
+		log.Printf("启用DNS代理...")
+		dnsProxy = NewDNSProxy()
+		err = dnsProxy.Start()
+		if err != nil {
+			log.Printf("启动DNS代理失败: %v", err)
+		} else {
+			log.Printf("DNS代理已启动，监听地址: %s", dnsProxy.listenAddr)
+
+			// 如果启用了DNS代理，将DNS服务器设置为127.0.0.1
+			if runtime.GOOS == "windows" {
+				// 获取TUN接口索引
+				cmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.Name -eq '%s' -or $_.InterfaceDescription -like '*WireGuard*'} | Select-Object -ExpandProperty ifIndex", wgDevice.TunName)
+				output, _ := runCommand(cmd)
+				ifIndex := strings.TrimSpace(output)
+				if ifIndex != "" {
+					// 配置DNS服务器为本地DNS代理
+					cmd = fmt.Sprintf("Set-DnsClientServerAddress -InterfaceIndex %s -ServerAddresses '127.0.0.1'", ifIndex)
+					_, _ = runCommand(cmd)
+					log.Printf("已将DNS服务器设置为本地DNS代理")
+				}
+			}
+		}
+	}
+
+	// 测试互联网连接
+	go func() {
+		// 等待一段时间让VPN连接稳定
+		time.Sleep(5 * time.Second)
+		testInternetConnection()
+	}()
 
 	// 等待信号
 	sigCh := make(chan os.Signal, 1)
@@ -131,6 +234,12 @@ func main() {
 	log.Printf("正在关闭WireGuard客户端...")
 
 	// 清理资源
+	// 如果启用了DNS代理，停止DNS代理
+	if dnsProxy != nil {
+		log.Printf("正在停止DNS代理...")
+		dnsProxy.Stop()
+	}
+
 	log.Printf("正在关闭WireGuard设备...")
 	wgDevice.Close()
 
@@ -532,7 +641,10 @@ func generateNewConfig(endpoint, clientIPStr string) (*wireguard.Config, error) 
 
 // configureTunIP 配置TUN设备IP地址
 func configureTunIP(tunName string, ip net.IP, ipNet *net.IPNet) error {
-	// 根据操作系统配置IP地址
+	// 设置一个适合VPN的MTU值
+	mtu := 1380 // 使用更保守的MTU值
+
+	// 根据操作系统配置IP地址和MTU
 	switch runtime.GOOS {
 	case "linux":
 		// 使用ip命令配置
@@ -541,6 +653,10 @@ func configureTunIP(tunName string, ip net.IP, ipNet *net.IPNet) error {
 		if err != nil {
 			return fmt.Errorf("配置IP地址失败: %v", err)
 		}
+
+		// 设置MTU值
+		cmd = fmt.Sprintf("ip link set dev %s mtu %d", tunName, mtu)
+		_, _ = runCommand(cmd)
 
 		// 启用设备
 		cmd = fmt.Sprintf("ip link set dev %s up", tunName)
@@ -558,6 +674,11 @@ func configureTunIP(tunName string, ip net.IP, ipNet *net.IPNet) error {
 		if err != nil {
 			return fmt.Errorf("配置IP地址失败: %v", err)
 		}
+
+		// 设置MTU值
+		cmd = fmt.Sprintf("ifconfig %s mtu %d", tunName, mtu)
+		_, _ = runCommand(cmd)
+
 		return nil
 
 	case "windows":
@@ -610,6 +731,14 @@ func configureTunIP(tunName string, ip net.IP, ipNet *net.IPNet) error {
 				return fmt.Errorf("配置IP地址失败: %v", err)
 			}
 		}
+
+		// 设置MTU值
+		cmd = fmt.Sprintf("netsh interface ipv4 set subinterface \"%s\" mtu=%d store=persistent", tunName, mtu)
+		_, _ = runCommand(cmd)
+
+		// 使用PowerShell设置MTU值（备用方法）
+		cmd = fmt.Sprintf("Set-NetIPInterface -InterfaceAlias '%s' -NlMtuBytes %d -ErrorAction SilentlyContinue", tunName, mtu)
+		_, _ = runCommand(cmd)
 		return nil
 
 	default:
@@ -659,6 +788,8 @@ func maskBits(mask net.IPMask) int {
 
 // addRoute 添加路由
 func addRoute(network, tunName string) error {
+	log.Printf("正在添加路由: %s 通过 %s", network, tunName)
+
 	// 根据操作系统添加路由
 	switch runtime.GOOS {
 	case "linux":
@@ -687,49 +818,149 @@ func addRoute(network, tunName string) error {
 		ip := ipNet.IP.String()
 		mask := net.IP(ipNet.Mask).String()
 
+		// 先检查当前路由表
+		checkCmd := "route print"
+		routeOutput, _ := runCommand(checkCmd)
+		log.Printf("当前路由表(摘要):\n%s", truncateOutput(routeOutput, 20))
+
 		// 获取TUN设备的IP地址作为网关
 		tunIP, err := getTunIP(tunName)
 		if err != nil {
 			// 如果无法获取TUN设备IP，尝试使用默认网关
 			log.Printf("无法获取TUN设备IP，将使用默认网关: %v", err)
+
+			// 先删除可能存在的路由
+			deleteCmd := fmt.Sprintf("route delete %s", ip)
+			_, _ = runCommand(deleteCmd)
+			time.Sleep(500 * time.Millisecond)
+
+			// 使用非常低的metric值确保优先级最高
 			cmd := fmt.Sprintf("route add %s mask %s 0.0.0.0 metric 1", ip, mask)
 			_, err = runCommand(cmd)
 			if err != nil {
-				return fmt.Errorf("添加路由失败: %v", err)
+				// 如果失败，尝试使用PowerShell命令
+				psCmd := fmt.Sprintf("New-NetRoute -DestinationPrefix %s/%d -NextHop 0.0.0.0 -RouteMetric 1 -ErrorAction SilentlyContinue",
+					ip, maskBits(ipNet.Mask))
+				_, err = runCommand(psCmd)
+				if err != nil {
+					return fmt.Errorf("添加路由失败: %v", err)
+				}
 			}
 		} else {
-			// 先检查是否已经存在路由
-			checkCmd := fmt.Sprintf("route print %s", ip)
-			output, _ := runCommand(checkCmd)
-			if strings.Contains(output, ip) {
-				log.Printf("发现已存在的路由，尝试删除: %s", ip)
-				deleteCmd := fmt.Sprintf("route delete %s mask %s", ip, mask)
-				_, _ = runCommand(deleteCmd)
-				// 等待一下，确保路由已经被清理
-				time.Sleep(1 * time.Second)
-			}
+			// 先删除可能存在的路由
+			deleteCmd := fmt.Sprintf("route delete %s", ip)
+			_, _ = runCommand(deleteCmd)
+			time.Sleep(500 * time.Millisecond)
 
 			// 使用TUN设备IP作为网关
-			// 在PowerShell中使用cmd.exe执行route命令
+			// 使用cmd.exe执行route命令，避免在PowerShell中的转义问题
 			cmd := fmt.Sprintf("cmd.exe /c \"route add %s mask %s %s metric 1\"", ip, mask, tunIP)
 			_, err = runCommand(cmd)
 			if err != nil {
-				// 如果失败，再次尝试删除路由并重新添加
-				deleteCmd := fmt.Sprintf("cmd.exe /c \"route delete %s mask %s\"", ip, mask)
-				_, _ = runCommand(deleteCmd)
-				time.Sleep(1 * time.Second)
-
-				// 重新添加路由
-				_, err = runCommand(cmd)
+				// 如果失败，尝试使用PowerShell命令
+				psCmd := fmt.Sprintf("New-NetRoute -DestinationPrefix %s/%d -InterfaceAlias '%s' -NextHop %s -RouteMetric 1 -ErrorAction SilentlyContinue",
+					ip, maskBits(ipNet.Mask), tunName, tunIP)
+				_, err = runCommand(psCmd)
 				if err != nil {
 					return fmt.Errorf("添加路由失败: %v", err)
 				}
 			}
 		}
+
+		// 验证路由是否添加成功
+		verifyCmd := fmt.Sprintf("route print %s", ip)
+		verifyOutput, _ := runCommand(verifyCmd)
+		if strings.Contains(verifyOutput, ip) {
+			log.Printf("路由添加成功: %s", ip)
+		} else {
+			log.Printf("警告: 无法验证路由是否添加成功: %s", ip)
+		}
+
 		return nil
 
 	default:
 		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
+
+// truncateOutput 截断输出，只显示前几行
+func truncateOutput(output string, maxLines int) string {
+	lines := strings.Split(output, "\n")
+	if len(lines) <= maxLines {
+		return output
+	}
+
+	return strings.Join(lines[:maxLines], "\n") + "\n... (输出已截断)"
+}
+
+// getDefaultGateway 获取默认网关
+func getDefaultGateway() (string, error) {
+	switch runtime.GOOS {
+	case "windows":
+		// 方法1: 使用PowerShell
+		cmd := "Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.RouteMetric -ne 1 } | Select-Object -First 1 -ExpandProperty NextHop"
+		output, err := runCommand(cmd)
+		if err == nil {
+			gateway := strings.TrimSpace(output)
+			if gateway != "" {
+				return gateway, nil
+			}
+		}
+
+		// 方法2: 使用route命令
+		cmd = "cmd.exe /c \"route print 0.0.0.0 | findstr 0.0.0.0 | findstr /v 127.0.0.1 | findstr /v 0.0.0.0/0\""
+		output, _ = runCommand(cmd)
+		lines := strings.Split(output, "\n")
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 {
+				return fields[2], nil
+			}
+		}
+
+		// 方法3: 使用ipconfig
+		cmd = "ipconfig | findstr /i \"Default Gateway\""
+		output, _ = runCommand(cmd)
+		lines = strings.Split(output, "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "Default Gateway") {
+				parts := strings.Split(line, ":")
+				if len(parts) >= 2 {
+					return strings.TrimSpace(parts[1]), nil
+				}
+			}
+		}
+
+		return "", fmt.Errorf("无法获取默认网关")
+
+	case "linux":
+		// 使用ip route命令
+		cmd := "ip route | grep default | awk '{print $3}'"
+		output, err := runCommand(cmd)
+		if err == nil {
+			gateway := strings.TrimSpace(output)
+			if gateway != "" {
+				return gateway, nil
+			}
+		}
+
+		return "", fmt.Errorf("无法获取默认网关")
+
+	case "darwin": // macOS
+		// 使用route命令
+		cmd := "route -n get default | grep gateway | awk '{print $2}'"
+		output, err := runCommand(cmd)
+		if err == nil {
+			gateway := strings.TrimSpace(output)
+			if gateway != "" {
+				return gateway, nil
+			}
+		}
+
+		return "", fmt.Errorf("无法获取默认网关")
+
+	default:
+		return "", fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
 	}
 }
 
@@ -873,5 +1104,317 @@ func getTunIP(tunName string) (string, error) {
 
 	default:
 		return "", fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
+
+// optimizeRouting 优化路由
+func optimizeRouting(tunName string) {
+	log.Printf("正在优化路由...")
+
+	// 百度的IP范围
+	baiduIPs := []string{
+		"39.156.66.0/24",  // 百度部分IP范围
+		"220.181.38.0/24", // 百度部分IP范围
+	}
+
+	// 阿里云的IP范围
+	aliIPs := []string{
+		"47.92.0.0/16",  // 阿里云部分IP范围
+		"106.11.0.0/16", // 阿里云部分IP范围
+	}
+
+	// 腾讯的IP范围
+	tencentIPs := []string{
+		"119.28.0.0/16",  // 腾讯云部分IP范围
+		"123.207.0.0/16", // 腾讯云部分IP范围
+	}
+
+	// 合并所有国内IP范围
+	chinaIPs := append(baiduIPs, aliIPs...)
+	chinaIPs = append(chinaIPs, tencentIPs...)
+
+	switch runtime.GOOS {
+	case "windows":
+		// 获取默认网关
+		cmd := "Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.RouteMetric -ne 1 } | Select-Object -First 1 -ExpandProperty NextHop"
+		defaultGateway, err := runCommand(cmd)
+		if err != nil || defaultGateway == "" {
+			// 如果上面的方法失败，尝试使用其他方法
+			cmd = "cmd.exe /c \"route print 0.0.0.0 | findstr 0.0.0.0 | findstr /v 127.0.0.1 | findstr /v 0.0.0.0/0\""
+			output, _ := runCommand(cmd)
+			lines := strings.Split(output, "\n")
+			for _, line := range lines {
+				fields := strings.Fields(line)
+				if len(fields) >= 3 {
+					defaultGateway = fields[2]
+					break
+				}
+			}
+		}
+
+		defaultGateway = strings.TrimSpace(defaultGateway)
+		if defaultGateway == "" {
+			log.Printf("无法获取默认网关，路由优化失败")
+			return
+		}
+
+		log.Printf("默认网关: %s", defaultGateway)
+
+		// 为国内网站添加直接路由，不经过VPN
+		for _, ipRange := range chinaIPs {
+			// 解析IP范围
+			_, ipNet, err := net.ParseCIDR(ipRange)
+			if err != nil {
+				log.Printf("解析IP范围失败: %s, %v", ipRange, err)
+				continue
+			}
+
+			// 删除可能存在的路由
+			deleteCmd := fmt.Sprintf("route delete %s", ipNet.IP.String())
+			_, _ = runCommand(deleteCmd)
+
+			// 添加直接路由，使用默认网关，设置较低的metric值
+			addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask %s %s metric 5\"",
+				ipNet.IP.String(),
+				net.IP(ipNet.Mask).String(),
+				defaultGateway)
+			_, err = runCommand(addCmd)
+			if err != nil {
+				log.Printf("添加国内直接路由失败: %s, %v", ipRange, err)
+			} else {
+				log.Printf("已为 %s 添加直接路由", ipRange)
+			}
+		}
+
+	case "linux":
+		// 获取默认网关
+		cmd := "ip route | grep default | awk '{print $3}'"
+		defaultGateway, err := runCommand(cmd)
+		defaultGateway = strings.TrimSpace(defaultGateway)
+		if err != nil || defaultGateway == "" {
+			log.Printf("无法获取默认网关，路由优化失败")
+			return
+		}
+
+		// 为国内网站添加直接路由
+		for _, ipRange := range chinaIPs {
+			cmd = fmt.Sprintf("ip route add %s via %s", ipRange, defaultGateway)
+			_, err = runCommand(cmd)
+			if err != nil {
+				log.Printf("添加国内直接路由失败: %s, %v", ipRange, err)
+			} else {
+				log.Printf("已为 %s 添加直接路由", ipRange)
+			}
+		}
+
+	case "darwin": // macOS
+		// 获取默认网关
+		cmd := "route -n get default | grep gateway | awk '{print $2}'"
+		defaultGateway, err := runCommand(cmd)
+		defaultGateway = strings.TrimSpace(defaultGateway)
+		if err != nil || defaultGateway == "" {
+			log.Printf("无法获取默认网关，路由优化失败")
+			return
+		}
+
+		// 为国内网站添加直接路由
+		for _, ipRange := range chinaIPs {
+			cmd = fmt.Sprintf("route add -net %s %s", ipRange, defaultGateway)
+			_, err = runCommand(cmd)
+			if err != nil {
+				log.Printf("添加国内直接路由失败: %s, %v", ipRange, err)
+			} else {
+				log.Printf("已为 %s 添加直接路由", ipRange)
+			}
+		}
+	}
+
+	log.Printf("路由优化完成")
+}
+
+// optimizeTCPParameters 优化TCP参数
+func optimizeTCPParameters() {
+	log.Printf("正在优化TCP参数...")
+
+	switch runtime.GOOS {
+	case "windows":
+		// 调整TCP窗口大小
+		cmd := "netsh interface tcp set global autotuninglevel=normal"
+		_, err := runCommand(cmd)
+		if err != nil {
+			log.Printf("调整TCP自动调优级别失败: %v", err)
+		}
+
+		// 调整TCP拥塞控制算法
+		cmd = "netsh interface tcp set global congestionprovider=ctcp"
+		_, err = runCommand(cmd)
+		if err != nil {
+			log.Printf("调整TCP拥塞控制算法失败: %v", err)
+		}
+
+		// 启用TCP延迟确认
+		cmd = "netsh interface tcp set global ecncapability=enabled"
+		_, _ = runCommand(cmd)
+
+	case "linux":
+		// 调整TCP窗口大小
+		cmd := "sysctl -w net.ipv4.tcp_wmem='4096 65536 4194304'"
+		_, _ = runCommand(cmd)
+
+		cmd = "sysctl -w net.ipv4.tcp_rmem='4096 87380 4194304'"
+		_, _ = runCommand(cmd)
+
+		// 调整TCP拥塞控制算法
+		cmd = "sysctl -w net.ipv4.tcp_congestion_control=bbr"
+		_, _ = runCommand(cmd)
+
+	case "darwin": // macOS
+		// macOS上的TCP参数调整相对有限
+		cmd := "sysctl -w net.inet.tcp.win_scale_factor=8"
+		_, _ = runCommand(cmd)
+	}
+
+	log.Printf("TCP参数优化完成")
+}
+
+// configureDNS 配置DNS服务器
+func configureDNS(tunName string) error {
+	log.Printf("正在配置DNS服务器...")
+
+	switch runtime.GOOS {
+	case "windows":
+		// 获取TUN接口索引
+		cmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.Name -eq '%s' -or $_.InterfaceDescription -like '*WireGuard*'} | Select-Object -ExpandProperty ifIndex", tunName)
+		output, err := runCommand(cmd)
+		if err != nil {
+			return fmt.Errorf("获取TUN接口索引失败: %v", err)
+		}
+
+		ifIndex := strings.TrimSpace(output)
+		if ifIndex == "" {
+			return fmt.Errorf("无法获取TUN接口索引")
+		}
+
+		// 配置DNS服务器(使用Google DNS)
+		cmd = fmt.Sprintf("Set-DnsClientServerAddress -InterfaceIndex %s -ServerAddresses '8.8.8.8','8.8.4.4'", ifIndex) // Google DNS
+		_, err = runCommand(cmd)
+		if err != nil {
+			log.Printf("使用PowerShell配置DNS服务器失败: %v", err)
+
+			// 尝试使用netsh命令配置DNS
+			cmd = fmt.Sprintf("netsh interface ip set dns name=\"%s\" static 8.8.8.8 primary", tunName) // Google DNS
+			_, err = runCommand(cmd)
+			if err != nil {
+				return fmt.Errorf("配置DNS服务器失败: %v", err)
+			}
+
+			cmd = fmt.Sprintf("netsh interface ip add dns name=\"%s\" 8.8.4.4 index=2", tunName) // Google DNS
+			_, _ = runCommand(cmd)
+		}
+
+		log.Printf("已为接口%s配置DNS服务器", tunName)
+
+		// 刷新DNS缓存
+		cmd = "ipconfig /flushdns"
+		_, _ = runCommand(cmd)
+
+		return nil
+
+	case "linux":
+		// 在Linux上修改resolv.conf
+		cmd := "echo 'nameserver 8.8.8.8\nnameserver 8.8.4.4' > /etc/resolv.conf" // Google DNS
+		_, err := runCommand(cmd)
+		if err != nil {
+			return fmt.Errorf("配置DNS服务器失败: %v", err)
+		}
+		return nil
+
+	case "darwin": // macOS
+		// 在macOS上使用networksetup命令
+		cmd := fmt.Sprintf("networksetup -setdnsservers %s 8.8.8.8 8.8.4.4", tunName) // Google DNS
+		_, err := runCommand(cmd)
+		if err != nil {
+			return fmt.Errorf("配置DNS服务器失败: %v", err)
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
+
+// testInternetConnection 测试互联网连接
+func testInternetConnection() {
+	log.Printf("正在测试互联网连接...")
+
+	// 测试DNS解析 - 使用百度域名
+	cmd := "nslookup baidu.com"
+	output, err := runCommand(cmd)
+	if err != nil {
+		log.Printf("DNS解析测试(百度)失败: %v\n%s", err, truncateOutput(output, 10))
+	} else {
+		log.Printf("DNS解析测试(百度)成功")
+	}
+
+	// 测试DNS解析 - 使用Google域名
+	cmd = "nslookup google.com"
+	output, err = runCommand(cmd)
+	if err != nil {
+		log.Printf("DNS解析测试(Google)失败: %v\n%s", err, truncateOutput(output, 10))
+	} else {
+		log.Printf("DNS解析测试(Google)成功")
+	}
+
+	// 测试ICMP连接 - 使用Google DNS
+	cmd = "ping -n 3 8.8.8.8"
+	output, err = runCommand(cmd)
+	if err != nil {
+		log.Printf("ICMP连接测试(Google DNS)失败: %v\n%s", err, truncateOutput(output, 10))
+	} else {
+		log.Printf("ICMP连接测试(Google DNS)成功")
+	}
+
+	// 测试HTTP连接 - 使用百度
+	if runtime.GOOS == "windows" {
+		// Windows上使用PowerShell的Invoke-WebRequest
+		cmd = "Invoke-WebRequest -Uri 'https://www.baidu.com' -UseBasicParsing -Method Head | Select-Object -ExpandProperty StatusCode"
+		output, err = runCommand(cmd)
+		if err != nil {
+			// 如果失败，尝试使用系统自带的curl
+			cmd = "cmd.exe /c curl -s -o nul -w \"HTTP状态码: %{http_code}\" https://www.baidu.com"
+			output, err = runCommand(cmd)
+		}
+	} else {
+		// 其他系统使用curl
+		cmd = "curl -s -o /dev/null -w \"HTTP状态码: %{http_code}\" https://www.baidu.com"
+		output, err = runCommand(cmd)
+	}
+
+	if err != nil {
+		log.Printf("HTTP连接测试(百度)失败: %v\n%s", err, truncateOutput(output, 10))
+	} else {
+		log.Printf("HTTP连接测试(百度)成功: %s", output)
+	}
+
+	// 测试HTTP连接 - 使用Google
+	if runtime.GOOS == "windows" {
+		// Windows上使用PowerShell的Invoke-WebRequest
+		cmd = "Invoke-WebRequest -Uri 'https://www.google.com' -UseBasicParsing -Method Head | Select-Object -ExpandProperty StatusCode"
+		output, err = runCommand(cmd)
+		if err != nil {
+			// 如果失败，尝试使用系统自带的curl
+			cmd = "cmd.exe /c curl -s -o nul -w \"HTTP状态码: %{http_code}\" https://www.google.com"
+			output, err = runCommand(cmd)
+		}
+	} else {
+		// 其他系统使用curl
+		cmd = "curl -s -o /dev/null -w \"HTTP状态码: %{http_code}\" https://www.google.com"
+		output, err = runCommand(cmd)
+	}
+
+	if err != nil {
+		log.Printf("HTTP连接测试(Google)失败: %v\n%s", err, truncateOutput(output, 10))
+	} else {
+		log.Printf("HTTP连接测试(Google)成功: %s", output)
 	}
 }

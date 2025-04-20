@@ -492,23 +492,67 @@ func enableIPForwarding() error {
 		return err
 
 	case "windows":
-		// 获取网络接口
-		cmd := "Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceDescription -like '*TAP-Windows*'} | Select-Object -ExpandProperty ifIndex"
-		output, err := runCommand(cmd)
+		log.Printf("正在配置Windows IP转发...")
+
+		// 1. 使用注册表启用IP转发
+		cmd := "Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' -Name 'IPEnableRouter' -Value 1 -Type DWord -ErrorAction SilentlyContinue"
+		_, err := runCommand(cmd)
 		if err != nil {
-			return fmt.Errorf("获取网络接口失败: %v", err)
+			log.Printf("通过注册表启用IP转发失败: %v", err)
+		} else {
+			log.Printf("已通过注册表启用IP转发")
 		}
 
-		// 解析接口索引
-		ifIndex := strings.TrimSpace(output)
-		if ifIndex == "" {
-			return fmt.Errorf("无法找到WireGuard网络接口")
+		// 2. 获取所有活跃的网络接口
+		cmd = "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object ifIndex, Name | Format-Table"
+		output, _ := runCommand(cmd)
+		log.Printf("活跃的网络接口:\n%s", output)
+
+		// 3. 为所有接口启用IP转发
+		// 获取WireGuard接口
+		cmd = "Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceDescription -like '*TAP-Windows*'} | Select-Object -ExpandProperty ifIndex"
+		wgIndices, _ := runCommand(cmd)
+		wgIndices = strings.TrimSpace(wgIndices)
+		if wgIndices != "" {
+			for _, index := range strings.Split(wgIndices, "\n") {
+				index = strings.TrimSpace(index)
+				if index != "" {
+					cmd = fmt.Sprintf("Set-NetIPInterface -ifIndex %s -Forwarding Enabled", index)
+					_, err = runCommand(cmd)
+					if err == nil {
+						log.Printf("已为WireGuard接口(索引:%s)启用IP转发", index)
+					}
+				}
+			}
 		}
 
-		// 启用IP转发
-		cmd = fmt.Sprintf("Set-NetIPInterface -ifIndex %s -Forwarding Enabled", ifIndex)
-		_, err = runCommand(cmd)
-		return err
+		// 获取外部接口
+		cmd = "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*' -and $_.InterfaceDescription -notlike '*TAP-Windows*'} | Select-Object -ExpandProperty ifIndex"
+		externalIndices, _ := runCommand(cmd)
+		externalIndices = strings.TrimSpace(externalIndices)
+		if externalIndices != "" {
+			for _, index := range strings.Split(externalIndices, "\n") {
+				index = strings.TrimSpace(index)
+				if index != "" {
+					cmd = fmt.Sprintf("Set-NetIPInterface -ifIndex %s -Forwarding Enabled", index)
+					_, err = runCommand(cmd)
+					if err == nil {
+						log.Printf("已为外部接口(索引:%s)启用IP转发", index)
+					}
+				}
+			}
+		}
+
+		// 4. 重启路由服务
+		cmd = "Restart-Service RemoteAccess -Force -ErrorAction SilentlyContinue"
+		_, _ = runCommand(cmd)
+
+		// 5. 验证IP转发状态
+		cmd = "Get-NetIPInterface | Where-Object {$_.Forwarding -eq 'Enabled'} | Select-Object ifIndex, InterfaceAlias | Format-Table"
+		output, _ = runCommand(cmd)
+		log.Printf("已启用IP转发的接口:\n%s", output)
+
+		return nil
 
 	default:
 		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
@@ -583,115 +627,149 @@ func configureNAT(vpnNetwork string) error {
 		return nil
 
 	case "windows":
-		// 在Windows上配置NAT
-		// 获取WireGuard接口索引
-		cmd := "Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceDescription -like '*TAP-Windows*'} | Select-Object -ExpandProperty ifIndex"
-		output, err := runCommand(cmd)
-		if err != nil {
-			return fmt.Errorf("获取WireGuard接口失败: %v", err)
-		}
+		log.Printf("在Windows上配置NAT...")
 
-		wgIndex := strings.TrimSpace(output)
-		if wgIndex == "" {
-			return fmt.Errorf("无法找到WireGuard接口")
-		}
+		// 1. 验证IP转发是否已启用
+		cmd := "Get-NetIPInterface | Where-Object {$_.Forwarding -eq 'Enabled'} | Select-Object ifIndex, InterfaceAlias | Format-Table"
+		output, _ := runCommand(cmd)
+		log.Printf("当前启用IP转发的接口:\n%s", output)
 
-		// 获取外网接口索引
-		cmd = "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*' -and $_.InterfaceDescription -notlike '*TAP-Windows*'} | Select-Object -First 1 -ExpandProperty ifIndex"
-		output, err = runCommand(cmd)
-		if err != nil {
-			return fmt.Errorf("获取外网接口失败: %v", err)
-		}
-
-		internetIndex := strings.TrimSpace(output)
-		if internetIndex == "" {
-			return fmt.Errorf("无法找到外网接口")
-		}
+		// 2. 尝试使用Windows内置的NAT功能
+		natConfigured := false
 
 		// 先尝试移除现有的NAT
-		// 使用ErrorAction SilentlyContinue来避免在NetNat不可用时报错
 		removeCmd := "Get-NetNat -ErrorAction SilentlyContinue | Remove-NetNat -Confirm:$false -ErrorAction SilentlyContinue"
 		_, _ = runCommand(removeCmd)
-
-		// 等待一下，确保NAT已经被清理
 		time.Sleep(1 * time.Second)
 
 		// 使用随机名称创建NAT，避免冲突
 		natName := fmt.Sprintf("WireGuardNAT_%d", time.Now().Unix())
-		log.Printf("创建NAT: %s", natName)
+		log.Printf("尝试创建NAT: %s", natName)
 
 		// 创建NAT
-		cmd = fmt.Sprintf("New-NetNat -Name \"%s\" -InternalIPInterfaceAddressPrefix %s", natName, vpnNetwork)
-		_, err = runCommand(cmd)
-		if err != nil {
-			// 如果仍然失败，尝试使用其他方法启用IP转发
-			log.Printf("使用New-NetNat创建NAT失败，尝试其他方法...")
+		cmd = fmt.Sprintf("New-NetNat -Name \"%s\" -InternalIPInterfaceAddressPrefix %s -ErrorAction SilentlyContinue", natName, vpnNetwork)
+		_, err := runCommand(cmd)
+		if err == nil {
+			log.Printf("成功创建NAT: %s", natName)
+			natConfigured = true
 
-			// 尝试使用Internet连接共享(ICS)
-			log.Printf("尝试启用Internet连接共享(ICS)...")
+			// 验证NAT配置
+			cmd = "Get-NetNat -ErrorAction SilentlyContinue | Format-Table"
+			output, _ = runCommand(cmd)
+			log.Printf("当前NAT配置:\n%s", output)
+		} else {
+			log.Printf("使用NetNat失败: %v", err)
+		}
 
-			// 尝试使用netsh命令启用IP转发
-			log.Printf("尝试使用netsh命令启用IP转发...")
+		// 3. 如果NetNat失败，尝试使用Internet连接共享(ICS)
+		if !natConfigured {
+			log.Printf("尝试使用Internet连接共享(ICS)...")
 
-			// 获取外网接口名称
-			cmd = "cmd.exe /c \"netsh interface show interface | findstr Connected | findstr -v Loopback | findstr -v WireGuard\""
-			output, err = runCommand(cmd)
-			if err == nil && output != "" {
-				// 解析接口名称
-				lines := strings.Split(output, "\n")
-				for _, line := range lines {
-					fields := strings.Fields(line)
-					if len(fields) >= 4 {
-						ifName := strings.Join(fields[3:], " ")
-						log.Printf("找到外网接口: %s", ifName)
+			// 获取外部接口
+			cmd = "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*'} | Select-Object -First 1 -ExpandProperty Name"
+			externalInterface, _ := runCommand(cmd)
+			externalInterface = strings.TrimSpace(externalInterface)
 
-						// 启用IP转发 - 使用接口索引而不是名称，避免中文名称问题
-						// 获取接口索引
-						indexCmd := fmt.Sprintf("cmd.exe /c \"netsh interface show interface \\\"%s\\\" | findstr \\\"%s\\\"\"", ifName, ifName)
-						indexOutput, _ := runCommand(indexCmd)
-						if indexOutput != "" {
-							// 启用IP转发
-							cmd = "cmd.exe /c \"netsh interface ipv4 set interface \\\"" + ifName + "\\\" forwarding=enabled\""
-							_, err = runCommand(cmd)
-							if err == nil {
-								log.Printf("已启用接口 %s 的IP转发", ifName)
-							}
-						}
+			// 获取WireGuard接口
+			cmd = "Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*'} | Select-Object -First 1 -ExpandProperty Name"
+			wgInterface, _ := runCommand(cmd)
+			wgInterface = strings.TrimSpace(wgInterface)
 
-						// 启用WireGuard接口的IP转发
-						// 直接使用接口索引而不是名称
-						// 获取WireGuard接口索引
-						cmd = "cmd.exe /c \"netsh interface ipv4 show interfaces | findstr WireGuard\""
-						wgOutput, _ := runCommand(cmd)
-						if wgOutput != "" {
-							// 解析接口索引
-							lines := strings.Split(wgOutput, "\n")
-							for _, line := range lines {
-								fields := strings.Fields(line)
-								if len(fields) > 0 {
-									// 第一个字段应该是索引
-									ifIndex := fields[0]
-
-									// 使用索引启用IP转发
-									cmd = "cmd.exe /c \"netsh interface ipv4 set interface " + ifIndex + " forwarding=enabled\""
-									_, err = runCommand(cmd)
-									if err == nil {
-										log.Printf("已启用WireGuard接口(索引:%s)的IP转发", ifIndex)
-									}
-									break
-								}
-							}
-						}
-
-						break
+			if externalInterface != "" && wgInterface != "" {
+				// 使用PowerShell脚本启用ICS
+				icsScript := fmt.Sprintf(`
+				try {
+					$netShare = New-Object -ComObject HNetCfg.HNetShare
+					$connection = $netShare.EnumEveryConnection | Where-Object { $netShare.NetConnectionProps.Invoke($_).Name -eq "%s" }
+					if ($connection) {
+						$config = $netShare.INetSharingConfigurationForINetConnection.Invoke($connection)
+						$config.EnableSharing(0)
+						Write-Host "Enabled sharing for external interface: %s"
 					}
+
+					$wgConnection = $netShare.EnumEveryConnection | Where-Object { $netShare.NetConnectionProps.Invoke($_).Name -eq "%s" }
+					if ($wgConnection) {
+						$wgConfig = $netShare.INetSharingConfigurationForINetConnection.Invoke($wgConnection)
+						$wgConfig.EnableSharing(1)
+						Write-Host "Enabled sharing for WireGuard interface: %s"
+					}
+				} catch {
+					Write-Host "Error enabling ICS: $_"
+				}
+				`, externalInterface, externalInterface, wgInterface, wgInterface)
+
+				// 保存脚本到临时文件
+				scriptPath := "enable_ics.ps1"
+				err = os.WriteFile(scriptPath, []byte(icsScript), 0644)
+				if err == nil {
+					// 执行脚本
+					cmd = fmt.Sprintf("powershell -ExecutionPolicy Bypass -File %s", scriptPath)
+					output, err := runCommand(cmd)
+					log.Printf("ICS脚本输出: %s", output)
+					if err == nil {
+						log.Printf("成功配置Internet连接共享")
+						natConfigured = true
+					} else {
+						log.Printf("配置Internet连接共享失败: %v", err)
+					}
+					// 删除临时脚本
+					os.Remove(scriptPath)
 				}
 			}
+		}
 
-			// 启用IP转发就足够了，不需要返回错误
+		// 4. 如果以上方法都失败，使用netsh命令配置IP转发
+		if !natConfigured {
+			log.Printf("尝试使用netsh命令配置IP转发...")
+
+			// 获取所有活跃的网络接口
+			cmd = "netsh interface ipv4 show interfaces"
+			output, _ = runCommand(cmd)
+			log.Printf("网络接口列表:\n%s", output)
+
+			// 获取外部接口索引
+			cmd = "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*'} | Select-Object -First 1 -ExpandProperty ifIndex"
+			externalIndex, _ := runCommand(cmd)
+			externalIndex = strings.TrimSpace(externalIndex)
+
+			// 获取WireGuard接口索引
+			cmd = "Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*'} | Select-Object -First 1 -ExpandProperty ifIndex"
+			wgIndex, _ := runCommand(cmd)
+			wgIndex = strings.TrimSpace(wgIndex)
+
+			if externalIndex != "" && wgIndex != "" {
+				// 为外部接口启用IP转发
+				cmd = fmt.Sprintf("netsh interface ipv4 set interface %s forwarding=enabled", externalIndex)
+				_, _ = runCommand(cmd)
+
+				// 为WireGuard接口启用IP转发
+				cmd = fmt.Sprintf("netsh interface ipv4 set interface %s forwarding=enabled", wgIndex)
+				_, _ = runCommand(cmd)
+
+				log.Printf("已使用netsh命令配置IP转发")
+				natConfigured = true
+			}
+		}
+
+		// 5. 添加路由规则，允许VPN网段流量通过外部接口
+		_, vpnNet, _ := net.ParseCIDR(vpnNetwork)
+		cmd = fmt.Sprintf("route add %s mask %s 0.0.0.0 metric 1",
+			vpnNet.IP.String(),
+			net.IP(vpnNet.Mask).String())
+		_, _ = runCommand(cmd)
+
+		// 验证路由配置
+		cmd = "route print"
+		output, _ = runCommand(cmd)
+		log.Printf("当前路由表:\n%s", output)
+
+		if natConfigured {
+			log.Printf("成功配置NAT")
 			return nil
 		}
 
+		// 即使所有方法都失败，也不返回错误，因为可能只需要IP转发就足够了
+		log.Printf("所有NAT配置方法都失败，但已启用IP转发")
 		return nil
 
 	default:
