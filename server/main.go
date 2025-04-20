@@ -896,6 +896,9 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 	log.Printf("客户端超时时间设置为 %d 分钟", *clientTimeout)
 	log.Printf("自动清理超时客户端: %v", *autoCleanup)
 
+	// 创建一个计数器，用于定期输出服务器公钥
+	pubKeyCounter := 0
+
 	// 每5秒检查一次客户端连接状态
 	for {
 		// 获取当前所有客户端
@@ -908,6 +911,15 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 
 		// 当前活跃的客户端
 		currentPeers := make(map[string]bool)
+
+		// 每12次循环（大约60秒）输出一次服务器公钥和客户端数量
+		pubKeyCounter++
+		if pubKeyCounter >= 12 {
+			serverPublicKey := wireguard.GeneratePublicKey(wgDevice.Config.PrivateKey).String()
+			log.Printf("服务器公钥: %s", serverPublicKey)
+			log.Printf("当前连接的客户端数量: %d", len(peers))
+			pubKeyCounter = 0
+		}
 
 		// 检查每个客户端
 		for _, peer := range peers {

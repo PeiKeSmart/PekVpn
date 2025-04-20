@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -37,6 +38,7 @@ var (
 	useDNSProxy    = flag.Bool("dns-proxy", false, "是否使用DNS代理")
 	mtuValue       = flag.Int("mtu", 0, "MTU值，0表示自动探测")
 	protectWebRTC  = flag.Bool("protect-webrtc", false, "是否启用WebRTC泄露防护")
+	diagnoseMode   = flag.Bool("diagnose", false, "是否启用诊断模式，用于判断无法联网的原因")
 
 	// 系统信息
 	hostname, _ = os.Hostname()
@@ -168,8 +170,8 @@ func main() {
 				deleteCmd := fmt.Sprintf("route delete %s", serverIP.String())
 				_, _ = runCommand(deleteCmd)
 
-				// 添加服务器特殊路由，使用默认网关，使用非常低的metric值
-				addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask 255.255.255.255 %s metric 1\"", serverIP.String(), defaultGateway)
+				// 添加服务器特殊路由，使用默认网关，使用最低的metric值(0)确保最高优先级
+				addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask 255.255.255.255 %s metric 0\"", serverIP.String(), defaultGateway)
 				_, err = runCommand(addCmd)
 				if err == nil {
 					log.Printf("已添加服务器特殊路由: %s -> %s (优先级最高)", serverIP.String(), defaultGateway)
@@ -178,6 +180,44 @@ func main() {
 				}
 			} else {
 				log.Printf("无法获取默认网关，服务器特殊路由添加失败")
+			}
+		}
+	}
+
+	// 验证服务器特殊路由是否添加成功
+	host, _, err = net.SplitHostPort(config.Endpoint)
+	if err == nil {
+		serverIP := net.ParseIP(host)
+		if serverIP != nil && !serverIP.IsLoopback() {
+			verifyCmd := fmt.Sprintf("route print %s", serverIP.String())
+			verifyOutput, _ := runCommand(verifyCmd)
+			if strings.Contains(verifyOutput, serverIP.String()) {
+				log.Printf("服务器特殊路由验证成功")
+			} else {
+				log.Printf("警告: 服务器特殊路由验证失败，这可能导致连接问题")
+
+				// 如果验证失败，再次尝试添加路由
+				log.Printf("再次尝试添加服务器特殊路由...")
+
+				// 获取默认网关
+				gatewayCmd := "cmd.exe /c \"route print 0.0.0.0 | findstr 0.0.0.0 | findstr /v 127.0.0.1 | findstr /v 0.0.0.0/0\""
+				gatewayOutput, _ := runCommand(gatewayCmd)
+				gatewayLines := strings.Split(gatewayOutput, "\n")
+				defaultGateway := ""
+				for _, line := range gatewayLines {
+					fields := strings.Fields(line)
+					if len(fields) >= 3 {
+						defaultGateway = fields[2]
+						break
+					}
+				}
+
+				if defaultGateway != "" {
+					// 再次尝试添加路由
+					addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask 255.255.255.255 %s metric 0\"", serverIP.String(), defaultGateway)
+					_, _ = runCommand(addCmd)
+					log.Printf("再次添加服务器特殊路由: %s -> %s", serverIP.String(), defaultGateway)
+				}
 			}
 		}
 	}
@@ -244,6 +284,12 @@ func main() {
 		time.Sleep(5 * time.Second)
 		testInternetConnection()
 
+		// 如果启用了诊断模式，运行诊断
+		if *diagnoseMode {
+			log.Printf("启动诊断模式，判断无法联网的原因...")
+			DiagnoseProblem(config, wgDevice)
+		}
+
 		// 实施反检测措施
 		time.Sleep(1 * time.Second)
 		implementAntiDetectionMeasures()
@@ -306,6 +352,44 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	// 创建一个通道用于手动运行诊断
+	diagnoseCh := make(chan struct{}, 1)
+
+	// 启动一个协程监听用户输入
+	go func() {
+		reader := bufio.NewReader(os.Stdin)
+		for {
+			text, _ := reader.ReadString('\n')
+			text = strings.TrimSpace(text)
+			if text == "diagnose" || text == "d" {
+				log.Printf("收到诊断命令，开始运行诊断...")
+				select {
+				case diagnoseCh <- struct{}{}:
+				default:
+					log.Printf("诊断已在运行中，请稍后再试")
+				}
+			} else if text == "help" || text == "h" {
+				fmt.Println("可用命令:")
+				fmt.Println("  diagnose, d - 运行诊断，判断无法联网的原因")
+				fmt.Println("  help, h     - 显示帮助信息")
+				fmt.Println("  exit, q     - 退出程序")
+			} else if text == "exit" || text == "q" {
+				log.Printf("收到退出命令，正在关闭...")
+				sigCh <- syscall.SIGTERM
+				break
+			}
+		}
+	}()
+
+	// 启动一个协程处理诊断请求
+	go func() {
+		for range diagnoseCh {
+			log.Printf("正在运行诊断...")
+			DiagnoseProblem(config, wgDevice)
+			log.Printf("诊断完成")
+		}
+	}()
+
 	<-sigCh
 	log.Printf("正在关闭WireGuard客户端...")
 
@@ -313,7 +397,22 @@ func main() {
 	log.Printf("正在清理资源，恢复网络配置...")
 
 	// 1. 先清理路由，顺序很重要
+	// 清理顺序很重要：先清理默认路由和VPN网段路由，最后再清理服务器特殊路由
+	// 这样可以确保在清理过程中，与VPN服务器的通信不会被中断
 	if runtime.GOOS == "windows" {
+		// 清理默认路由（如果启用了全局模式）
+		if *fullTunnel {
+			log.Printf("正在清理默认路由...")
+			deleteRoute("0.0.0.0/0")
+			log.Printf("已清理默认路由")
+		}
+
+		// 清理VPN网段路由
+		log.Printf("正在清理VPN网段路由...")
+		_, ipNet, _ := net.ParseCIDR(config.AllowedIPs[0].String())
+		deleteRoute(ipNet.String())
+		log.Printf("已清理VPN网段路由: %s", ipNet.String())
+
 		// 清理服务器特殊路由
 		log.Printf("正在清理服务器特殊路由...")
 		host, _, err := net.SplitHostPort(config.Endpoint)
@@ -323,19 +422,6 @@ func main() {
 				deleteRoute(serverIP.String())
 				log.Printf("已清理服务器特殊路由: %s", serverIP.String())
 			}
-		}
-
-		// 清理VPN网段路由
-		log.Printf("正在清理VPN网段路由...")
-		_, ipNet, _ := net.ParseCIDR(config.AllowedIPs[0].String())
-		deleteRoute(ipNet.String())
-		log.Printf("已清理VPN网段路由: %s", ipNet.String())
-
-		// 清理默认路由（如果启用了全局模式）
-		if *fullTunnel {
-			log.Printf("正在清理默认路由...")
-			deleteRoute("0.0.0.0/0")
-			log.Printf("已清理默认路由")
 		}
 
 		// 验证路由是否清理成功
