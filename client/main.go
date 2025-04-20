@@ -246,18 +246,6 @@ func main() {
 		// 实施反检测措施
 		time.Sleep(1 * time.Second)
 		implementAntiDetectionMeasures()
-
-		// 诊断百度网站连接
-		time.Sleep(2 * time.Second)
-		diagnoseBaiduConnection()
-
-		// 优化TCP参数
-		time.Sleep(1 * time.Second)
-		optimizeTCPForBaidu()
-
-		// 预热百度连接
-		time.Sleep(1 * time.Second)
-		warmupBaiduConnection()
 	}()
 
 	// 定期重新探测MTU值
@@ -299,8 +287,7 @@ func main() {
 		}
 	}()
 
-	// 启动百度连接监控和优化
-	monitorAndOptimizeBaiduConnection(wgDevice)
+	// 百度连接监控和优化功能已禁用
 
 	// 等待信号
 	sigCh := make(chan os.Signal, 1)
@@ -1865,264 +1852,37 @@ func flushDNSCache() {
 	}
 }
 
-// diagnoseBaiduConnection 诊断百度网站连接问题
+// diagnoseBaiduConnection 诊断百度网站连接问题 - 已禁用
 func diagnoseBaiduConnection() {
-	log.Printf("开始诊断百度网站连接问题...")
-
-	// 1. 测试DNS解析时间
-	log.Printf("测试百度DNS解析时间...")
-	dnsStartTime := time.Now()
-	cmd := "nslookup www.baidu.com"
-	dnsOutput, _ := runCommand(cmd)
-	dnsDuration := time.Since(dnsStartTime)
-	log.Printf("百度DNS解析耗时: %v", dnsDuration)
-
-	// 提取IP地址
-	var baiduIP string
-	lines := strings.Split(dnsOutput, "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "Address:") && !strings.Contains(line, "8.8.8.8") {
-			parts := strings.Split(line, ":")
-			if len(parts) >= 2 {
-				ip := strings.TrimSpace(parts[1])
-				if net.ParseIP(ip) != nil && !strings.HasPrefix(ip, "127.") && ip != "8.8.8.8" && ip != "8.8.4.4" {
-					baiduIP = ip
-					break
-				}
-			}
-		}
-	}
-
-	// 如果上面的方法无法提取IP，尝试使用其他方法
-	if baiduIP == "" {
-		// 使用ping命令获取IP
-		cmd = "ping -n 1 www.baidu.com"
-		pingOutput, _ := runCommand(cmd)
-		lines = strings.Split(pingOutput, "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "Pinging") && strings.Contains(line, "[") && strings.Contains(line, "]") {
-				// 从形如 "Pinging www.baidu.com [39.156.66.10] with 32 bytes of data:" 提取IP
-				start := strings.Index(line, "[") + 1
-				end := strings.Index(line, "]")
-				if start > 0 && end > start {
-					ip := line[start:end]
-					if net.ParseIP(ip) != nil {
-						baiduIP = ip
-						break
-					}
-				}
-			}
-		}
-	}
-
-	// 如果仍然无法获取IP，使用确定的百度IP
-	if baiduIP == "" {
-		baiduIP = "39.156.66.10" // 百度的一个已知IP
-		log.Printf("无法自动获取百度IP，使用默认IP: %s", baiduIP)
-	}
-
-	if baiduIP == "" {
-		log.Printf("无法解析百度IP地址")
-		return
-	}
-
-	log.Printf("百度IP地址: %s", baiduIP)
-
-	// 2. 测试ICMP延迟
-	log.Printf("测试到百度服务器的ICMP延迟...")
-	cmd = fmt.Sprintf("ping -n 4 %s", baiduIP)
-	pingOutput, _ := runCommand(cmd)
-	log.Printf("PING测试结果:\n%s", truncateOutput(pingOutput, 10))
-
-	// 3. 测试TCP连接时间
-	log.Printf("测试到百度服务器的TCP连接时间...")
-	tcpStartTime := time.Now()
-
-	// 使用简单的telnet测试TCP连接
-	cmd = fmt.Sprintf("ping -n 1 -w 1000 %s", baiduIP)
-	_, _ = runCommand(cmd)
-
-	tcpDuration := time.Since(tcpStartTime)
-	log.Printf("TCP连接测试结果: 耗时 %v", tcpDuration)
-
-	// 4. 测试HTTP请求时间（不包括资源）
-	log.Printf("测试百度HTTP请求时间...")
-	httpStartTime := time.Now()
-
-	// 使用简单的HTTP请求测试
-	cmd = "powershell -Command \"(Measure-Command { Invoke-WebRequest -Uri 'https://www.baidu.com' -Method Head -UseBasicParsing }).TotalMilliseconds\""
-	httpOutput, _ := runCommand(cmd)
-	httpDuration := time.Since(httpStartTime)
-	log.Printf("HTTP请求测试结果: %s 毫秒 (总耗时: %v)", httpOutput, httpDuration)
-
-	// 5. 测试路由跟踪
-	log.Printf("测试到百度服务器的路由跟踪...")
-	cmd = fmt.Sprintf("tracert -d -h 15 %s", baiduIP)
-	traceOutput, _ := runCommand(cmd)
-	log.Printf("路由跟踪结果:\n%s", truncateOutput(traceOutput, 20))
-
-	log.Printf("百度网站连接诊断完成")
+	log.Printf("百度网站连接诊断功能已禁用")
 }
 
-// optimizeTCPForBaidu 优化TCP连接参数
+// optimizeTCPForBaidu 优化TCP连接参数 - 已禁用
 func optimizeTCPForBaidu() {
-	if runtime.GOOS != "windows" {
-		return
-	}
-
-	log.Printf("正在优化TCP连接参数...")
-
-	// 减少TCP初始超时时间
-	cmd := "netsh int tcp set global initialRto=1000"
-	_, _ = runCommand(cmd)
-
-	// 启用TCP快速打开
-	cmd = "netsh int tcp set global fastopen=enabled"
-	_, _ = runCommand(cmd)
-
-	// 启用TCP时间戳
-	cmd = "netsh int tcp set global timestamps=enabled"
-	_, _ = runCommand(cmd)
-
-	// 增加初始拥塞窗口
-	cmd = "netsh int tcp set global initialcwnd=10"
-	_, _ = runCommand(cmd)
-
-	log.Printf("TCP连接参数优化完成")
+	log.Printf("TCP连接参数优化功能已禁用")
 }
 
-// warmupBaiduConnection 预热百度网站连接
+// warmupBaiduConnection 预热百度网站连接 - 已禁用
 func warmupBaiduConnection() {
-	log.Printf("正在预热百度网站连接...")
-
-	// 获取百度IP地址
-	cmd := "nslookup www.baidu.com | findstr Address"
-	output, _ := runCommand(cmd)
-	var baiduIP string
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "Address:") && !strings.Contains(line, "8.8.8.8") {
-			parts := strings.Split(line, ":")
-			if len(parts) >= 2 {
-				ip := strings.TrimSpace(parts[1])
-				if net.ParseIP(ip) != nil && !strings.HasPrefix(ip, "127.") && ip != "8.8.8.8" && ip != "8.8.4.4" {
-					baiduIP = ip
-					break
-				}
-			}
-		}
-	}
-
-	// 如果上面的方法无法提取IP，尝试使用其他方法
-	if baiduIP == "" {
-		// 使用ping命令获取IP
-		cmd = "ping -n 1 www.baidu.com"
-		pingOutput, _ := runCommand(cmd)
-		lines = strings.Split(pingOutput, "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "Pinging") && strings.Contains(line, "[") && strings.Contains(line, "]") {
-				// 从形如 "Pinging www.baidu.com [39.156.66.10] with 32 bytes of data:" 提取IP
-				start := strings.Index(line, "[") + 1
-				end := strings.Index(line, "]")
-				if start > 0 && end > start {
-					ip := line[start:end]
-					if net.ParseIP(ip) != nil {
-						baiduIP = ip
-						break
-					}
-				}
-			}
-		}
-	}
-
-	// 如果仍然无法获取IP，使用确定的百度IP
-	if baiduIP == "" {
-		baiduIP = "39.156.66.10" // 百度的一个已知IP
-		log.Printf("无法自动获取百度IP，使用默认IP: %s", baiduIP)
-	}
-
-	// 预先建立多个TCP连接
-	for i := 0; i < 3; i++ {
-		go func() {
-			// 使用简单的HTTP请求预热连接
-			cmd := fmt.Sprintf("ping -n 1 -w 500 %s", baiduIP)
-			runCommand(cmd)
-
-			// 使用Invoke-WebRequest预热连接
-			cmd = fmt.Sprintf("powershell -Command \"try { Invoke-WebRequest -Uri 'http://%s' -Method HEAD -TimeoutSec 1 -UseBasicParsing -ErrorAction SilentlyContinue } catch {}\"", baiduIP)
-			runCommand(cmd)
-
-			cmd = "powershell -Command \"try { Invoke-WebRequest -Uri 'https://www.baidu.com' -Method HEAD -TimeoutSec 1 -UseBasicParsing -ErrorAction SilentlyContinue } catch {}\""
-			runCommand(cmd)
-		}()
-	}
-
-	log.Printf("百度网站连接预热完成")
+	log.Printf("百度网站连接预热功能已禁用")
 }
 
-// monitorAndOptimizeBaiduConnection 监控和优化百度连接
+// monitorAndOptimizeBaiduConnection 监控和优化百度连接 - 已禁用
 func monitorAndOptimizeBaiduConnection(wgDevice *wireguard.WireGuardDevice) {
-	log.Printf("启动百度连接监控和自动优化...")
-
-	go func() {
-		// 初始等待时间
-		time.Sleep(1 * time.Minute)
-
-		for {
-			// 测试百度连接
-			cmd := "powershell -Command \"(Measure-Command { Invoke-WebRequest -Uri 'https://www.baidu.com' -Method Head -UseBasicParsing }).TotalMilliseconds\""
-			output, err := runCommand(cmd)
-			if err != nil {
-				log.Printf("百度连接测试失败: %v", err)
-
-				// 连接失败，尝试重置连接
-				log.Printf("尝试重置百度连接...")
-				warmupBaiduConnection()
-			} else {
-				// 解析响应时间（毫秒）
-				responseTime, err := strconv.ParseFloat(strings.TrimSpace(output), 64)
-				if err == nil {
-					// 转换为秒
-					responseTimeSeconds := responseTime / 1000.0
-					log.Printf("百度响应时间: %.2f秒 (%.0f毫秒)", responseTimeSeconds, responseTime)
-
-					// 如果响应时间过长，尝试优化
-					if responseTimeSeconds > 5.0 {
-						log.Printf("百度响应时间过长，尝试优化...")
-
-						// 重新预热连接
-						warmupBaiduConnection()
-
-						// 如果使用自动MTU，尝试调整MTU
-						if *mtuValue == 0 && wgDevice != nil {
-							currentMTU := detectOptimalMTU()
-							newMTU := currentMTU - 20
-							if newMTU >= 1280 {
-								log.Printf("尝试调整MTU值: %d -> %d", currentMTU, newMTU)
-								updateMTU(wgDevice.TunName, newMTU)
-							}
-						}
-					}
-				}
-			}
-
-			// 等待下一次测试
-			time.Sleep(10 * time.Minute)
-		}
-	}()
+	log.Printf("百度连接监控和自动优化功能已禁用")
 }
 
 // testInternetConnection 测试互联网连接
 func testInternetConnection() {
 	log.Printf("正在测试互联网连接...")
 
-	// 测试DNS解析 - 使用百度域名
-	cmd := "nslookup baidu.com"
+	// 测试DNS解析 - 使用常用域名
+	cmd := "nslookup qq.com"
 	output, err := runCommand(cmd)
 	if err != nil {
-		log.Printf("DNS解析测试(百度)失败: %v\n%s", err, truncateOutput(output, 10))
+		log.Printf("DNS解析测试(QQ)失败: %v\n%s", err, truncateOutput(output, 10))
 	} else {
-		log.Printf("DNS解析测试(百度)成功")
+		log.Printf("DNS解析测试(QQ)成功")
 	}
 
 	// 测试DNS解析 - 使用Google域名
@@ -2143,26 +1903,26 @@ func testInternetConnection() {
 		log.Printf("ICMP连接测试(Google DNS)成功")
 	}
 
-	// 测试HTTP连接 - 使用百度
+	// 测试HTTP连接 - 使用常用网站
 	if runtime.GOOS == "windows" {
 		// Windows上使用PowerShell的Invoke-WebRequest
-		cmd = "Invoke-WebRequest -Uri 'https://www.baidu.com' -UseBasicParsing -Method Head | Select-Object -ExpandProperty StatusCode"
+		cmd = "Invoke-WebRequest -Uri 'https://www.qq.com' -UseBasicParsing -Method Head | Select-Object -ExpandProperty StatusCode"
 		output, err = runCommand(cmd)
 		if err != nil {
 			// 如果失败，尝试使用系统自带的curl
-			cmd = "cmd.exe /c curl -s -o nul -w \"HTTP状态码: %{http_code}\" https://www.baidu.com"
+			cmd = "cmd.exe /c curl -s -o nul -w \"HTTP状态码: %{http_code}\" https://www.qq.com"
 			output, err = runCommand(cmd)
 		}
 	} else {
 		// 其他系统使用curl
-		cmd = "curl -s -o /dev/null -w \"HTTP状态码: %{http_code}\" https://www.baidu.com"
+		cmd = "curl -s -o /dev/null -w \"HTTP状态码: %{http_code}\" https://www.qq.com"
 		output, err = runCommand(cmd)
 	}
 
 	if err != nil {
-		log.Printf("HTTP连接测试(百度)失败: %v\n%s", err, truncateOutput(output, 10))
+		log.Printf("HTTP连接测试(QQ)失败: %v\n%s", err, truncateOutput(output, 10))
 	} else {
-		log.Printf("HTTP连接测试(百度)成功: %s", output)
+		log.Printf("HTTP连接测试(QQ)成功: %s", output)
 	}
 
 	// 测试HTTP连接 - 使用Google
@@ -2190,40 +1950,40 @@ func testInternetConnection() {
 
 // isNetworkConnected 检查网络连接状态
 func isNetworkConnected() bool {
-	// 检查方法1: 尝试访问百度
-	cmd := "curl -s -o nul -w \"%{http_code}\" --connect-timeout 5 https://www.baidu.com"
+	// 检查方法1: 尝试访问常用网站
+	cmd := "curl -s -o nul -w \"%{http_code}\" --connect-timeout 5 https://www.qq.com"
 	output, err := runCommand(cmd)
-	if err == nil && strings.Contains(output, "200") {
-		log.Printf("网络连接正常: 可以访问百度")
-		return true
-	}
-
-	// 检查方法2: 尝试访问其他网站
-	cmd = "curl -s -o nul -w \"%{http_code}\" --connect-timeout 5 https://www.qq.com"
-	output, err = runCommand(cmd)
 	if err == nil && strings.Contains(output, "200") {
 		log.Printf("网络连接正常: 可以访问QQ")
 		return true
 	}
 
+	// 检查方法2: 尝试访问其他网站
+	cmd = "curl -s -o nul -w \"%{http_code}\" --connect-timeout 5 https://www.microsoft.com"
+	output, err = runCommand(cmd)
+	if err == nil && strings.Contains(output, "200") {
+		log.Printf("网络连接正常: 可以访问Microsoft")
+		return true
+	}
+
 	// 检查方法3: 尝试DNS解析
-	cmd = "nslookup baidu.com"
+	cmd = "nslookup qq.com"
 	_, err = runCommand(cmd)
 	if err == nil {
 		// DNS解析正常，再次尝试HTTP连接
-		cmd = "curl -s -o nul -w \"%{http_code}\" --connect-timeout 5 https://www.baidu.com"
+		cmd = "curl -s -o nul -w \"%{http_code}\" --connect-timeout 5 https://www.qq.com"
 		output, err = runCommand(cmd)
 		if err == nil && strings.Contains(output, "200") {
-			log.Printf("网络连接正常: DNS解析正常且可以访问百度")
+			log.Printf("网络连接正常: DNS解析正常且可以访问QQ")
 			return true
 		}
 	}
 
-	// 检查方法4: 尝试ping百度
-	cmd = "ping -n 1 -w 1000 baidu.com"
+	// 检查方法4: 尝试ping Google DNS
+	cmd = "ping -n 1 -w 1000 8.8.8.8"
 	_, err = runCommand(cmd)
 	if err == nil {
-		log.Printf("网络连接正常: 可以ping通百度")
+		log.Printf("网络连接正常: 可以ping通Google DNS")
 		return true
 	}
 
@@ -2580,12 +2340,12 @@ func optimizeHTTPRequestParameters() {
 		"Sec-Fetch-Dest" = "document"
 	}
 
-	# 尝试访问百度
+	# 尝试访问常用网站
 	try {
-		$response = Invoke-WebRequest -Uri "https://www.baidu.com" -Headers $headers -UseBasicParsing -TimeoutSec 10
-		Write-Output "百度访问成功，状态码: $($response.StatusCode)"
+		$response = Invoke-WebRequest -Uri "https://www.qq.com" -Headers $headers -UseBasicParsing -TimeoutSec 10
+		Write-Output "QQ访问成功，状态码: $($response.StatusCode)"
 	} catch {
-		Write-Output "百度访问失败: $_"
+		Write-Output "QQ访问失败: $_"
 	}
 	`
 
