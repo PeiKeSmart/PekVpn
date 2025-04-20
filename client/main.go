@@ -125,46 +125,48 @@ func main() {
 
 	// 添加路由顺序很重要，先添加服务器特殊路由，再添加VPN网段路由，最后添加默认路由
 
-	// 如果启用了全局代理，先添加服务器特殊路由，再添加默认路由
-	if *fullTunnel {
-		// 添加服务器特殊路由，确保与VPN服务器的通信不通过VPN
-		host, _, err := net.SplitHostPort(config.Endpoint)
-		if err == nil {
-			serverIP := net.ParseIP(host)
-			if serverIP != nil && !serverIP.IsLoopback() {
-				// 获取默认网关
-				defaultGateway := ""
+	// 无论是否启用全局代理，都需要添加服务器特殊路由
+	// 添加服务器特殊路由，确保与VPN服务器的通信不通过VPN
+	host, _, err := net.SplitHostPort(config.Endpoint)
+	if err == nil {
+		serverIP := net.ParseIP(host)
+		if serverIP != nil && !serverIP.IsLoopback() {
+			// 获取默认网关
+			defaultGateway := ""
 
-				// 使用route命令获取默认网关
-				cmd := "cmd.exe /c \"route print 0.0.0.0 | findstr 0.0.0.0 | findstr /v 127.0.0.1 | findstr /v 0.0.0.0/0\""
-				output, _ := runCommand(cmd)
-				lines := strings.Split(output, "\n")
-				for _, line := range lines {
-					fields := strings.Fields(line)
-					if len(fields) >= 3 {
-						defaultGateway = fields[2]
-						break
-					}
-				}
-
-				if defaultGateway != "" {
-					// 删除可能存在的路由
-					deleteCmd := fmt.Sprintf("route delete %s", serverIP.String())
-					_, _ = runCommand(deleteCmd)
-
-					// 添加服务器特殊路由，使用默认网关，使用非常低的metric值
-					addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask 255.255.255.255 %s metric 1\"", serverIP.String(), defaultGateway)
-					_, err = runCommand(addCmd)
-					if err == nil {
-						log.Printf("已添加服务器特殊路由: %s -> %s", serverIP.String(), defaultGateway)
-					}
+			// 使用route命令获取默认网关
+			cmd := "cmd.exe /c \"route print 0.0.0.0 | findstr 0.0.0.0 | findstr /v 127.0.0.1 | findstr /v 0.0.0.0/0\""
+			output, _ := runCommand(cmd)
+			lines := strings.Split(output, "\n")
+			for _, line := range lines {
+				fields := strings.Fields(line)
+				if len(fields) >= 3 {
+					defaultGateway = fields[2]
+					break
 				}
 			}
-		}
 
-		// 等待一下，确保服务器特殊路由生效
-		time.Sleep(500 * time.Millisecond)
+			if defaultGateway != "" {
+				// 删除可能存在的路由
+				deleteCmd := fmt.Sprintf("route delete %s", serverIP.String())
+				_, _ = runCommand(deleteCmd)
+
+				// 添加服务器特殊路由，使用默认网关，使用非常低的metric值
+				addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask 255.255.255.255 %s metric 1\"", serverIP.String(), defaultGateway)
+				_, err = runCommand(addCmd)
+				if err == nil {
+					log.Printf("已添加服务器特殊路由: %s -> %s (优先级最高)", serverIP.String(), defaultGateway)
+				} else {
+					log.Printf("添加服务器特殊路由失败: %v", err)
+				}
+			} else {
+				log.Printf("无法获取默认网关，服务器特殊路由添加失败")
+			}
+		}
 	}
+
+	// 等待一下，确保服务器特殊路由生效
+	time.Sleep(500 * time.Millisecond)
 
 	// 添加VPN网段路由
 	err = addRoute(config.AllowedIPs[0].String(), wgDevice.TunName)
@@ -234,27 +236,114 @@ func main() {
 	log.Printf("正在关闭WireGuard客户端...")
 
 	// 清理资源
-	// 如果启用了DNS代理，停止DNS代理
-	if dnsProxy != nil {
-		log.Printf("正在停止DNS代理...")
-		dnsProxy.Stop()
-	}
+	log.Printf("正在清理资源，恢复网络配置...")
 
-	log.Printf("正在关闭WireGuard设备...")
-	wgDevice.Close()
-
-	// 如果需要，可以清理路由
+	// 1. 先清理路由，顺序很重要
 	if runtime.GOOS == "windows" {
-		// 在Windows上清理路由
+		// 清理服务器特殊路由
+		log.Printf("正在清理服务器特殊路由...")
+		host, _, err := net.SplitHostPort(config.Endpoint)
+		if err == nil {
+			serverIP := net.ParseIP(host)
+			if serverIP != nil && !serverIP.IsLoopback() {
+				deleteCmd := fmt.Sprintf("route delete %s", serverIP.String())
+				_, _ = runCommand(deleteCmd)
+				log.Printf("已清理服务器特殊路由: %s", serverIP.String())
+			}
+		}
+
+		// 清理VPN网段路由
+		log.Printf("正在清理VPN网段路由...")
 		_, ipNet, _ := net.ParseCIDR(config.AllowedIPs[0].String())
 		ip := ipNet.IP.String()
 		mask := net.IP(ipNet.Mask).String()
 		cmd := fmt.Sprintf("cmd.exe /c \"route delete %s mask %s\"", ip, mask)
 		_, _ = runCommand(cmd)
+		log.Printf("已清理VPN网段路由")
 
-		// 等待一下，确保资源正确释放
+		// 清理默认路由（如果启用了全局模式）
+		if *fullTunnel {
+			log.Printf("正在清理默认路由...")
+			cmd = "cmd.exe /c \"route delete 0.0.0.0 mask 0.0.0.0\""
+			_, _ = runCommand(cmd)
+			log.Printf("已清理默认路由")
+		}
+
+		// 等待一下，确保路由清理生效
 		time.Sleep(500 * time.Millisecond)
 	}
+
+	// 2. 如果启用了DNS代理，停止DNS代理
+	if dnsProxy != nil {
+		log.Printf("正在停止DNS代理...")
+		dnsProxy.Stop()
+	}
+
+	// 3. 关闭WireGuard设备
+	log.Printf("正在关闭WireGuard设备...")
+	wgDevice.Close()
+
+	// 4. 恢复DNS设置
+	if runtime.GOOS == "windows" {
+		log.Printf("正在恢复DNS设置...")
+
+		// 获取所有活跃的网络适配器
+		cmd := "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object -ExpandProperty ifIndex"
+		output, _ := runCommand(cmd)
+		indices := strings.Split(strings.TrimSpace(output), "\n")
+
+		// 重置所有适配器的DNS设置
+		for _, index := range indices {
+			index = strings.TrimSpace(index)
+			if index != "" {
+				cmd = fmt.Sprintf("Set-DnsClientServerAddress -InterfaceIndex %s -ResetServerAddresses", index)
+				_, _ = runCommand(cmd)
+				log.Printf("已重置网络适配器 %s 的DNS设置", index)
+			}
+		}
+
+		// 刷新DNS缓存
+		cmd = "ipconfig /flushdns"
+		_, _ = runCommand(cmd)
+		log.Printf("已刷新DNS缓存")
+
+		// 重启 DNS客户端服务
+		cmd = "Restart-Service -Name Dnscache -Force"
+		_, _ = runCommand(cmd)
+		log.Printf("已重启DNS客户端服务")
+
+		// 等待DNS服务重启
+		time.Sleep(2 * time.Second)
+	}
+
+	// 5. 重新启用物理网络适配器
+	if runtime.GOOS == "windows" {
+		log.Printf("正在重新启用物理网络适配器...")
+
+		// 获取物理网络适配器
+		cmd := "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*' -and $_.InterfaceDescription -notlike '*TAP-Windows*'} | Select-Object -ExpandProperty Name"
+		output, _ := runCommand(cmd)
+		adapters := strings.Split(strings.TrimSpace(output), "\n")
+
+		// 重新启用物理网络适配器
+		for _, adapter := range adapters {
+			adapter = strings.TrimSpace(adapter)
+			if adapter != "" {
+				cmd = fmt.Sprintf("Restart-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
+				_, _ = runCommand(cmd)
+				log.Printf("已重新启用网络适配器: %s", adapter)
+			}
+		}
+
+		// 等待网络适配器重启
+		time.Sleep(3 * time.Second)
+	}
+
+	// 6. 测试网络连接是否恢复
+	go func() {
+		time.Sleep(2 * time.Second)
+		testNetworkAfterClose()
+	}()
 }
 
 // loadConfigFromFile 从文件加载WireGuard配置
@@ -818,6 +907,16 @@ func addRoute(network, tunName string) error {
 		ip := ipNet.IP.String()
 		mask := net.IP(ipNet.Mask).String()
 
+		// 判断是否是默认路由
+		isDefaultRoute := (ip == "0.0.0.0" && mask == "0.0.0.0")
+
+		// 设置metric值，默认路由使用更高的metric值，确保服务器特殊路由优先级更高
+		metricValue := 1
+		if isDefaultRoute {
+			metricValue = 10
+			log.Printf("添加默认路由，使用更高的metric值: %d", metricValue)
+		}
+
 		// 先检查当前路由表
 		checkCmd := "route print"
 		routeOutput, _ := runCommand(checkCmd)
@@ -834,13 +933,13 @@ func addRoute(network, tunName string) error {
 			_, _ = runCommand(deleteCmd)
 			time.Sleep(500 * time.Millisecond)
 
-			// 使用非常低的metric值确保优先级最高
-			cmd := fmt.Sprintf("route add %s mask %s 0.0.0.0 metric 1", ip, mask)
+			// 添加路由，使用适当的metric值
+			cmd := fmt.Sprintf("route add %s mask %s 0.0.0.0 metric %d", ip, mask, metricValue)
 			_, err = runCommand(cmd)
 			if err != nil {
 				// 如果失败，尝试使用PowerShell命令
-				psCmd := fmt.Sprintf("New-NetRoute -DestinationPrefix %s/%d -NextHop 0.0.0.0 -RouteMetric 1 -ErrorAction SilentlyContinue",
-					ip, maskBits(ipNet.Mask))
+				psCmd := fmt.Sprintf("New-NetRoute -DestinationPrefix %s/%d -NextHop 0.0.0.0 -RouteMetric %d -ErrorAction SilentlyContinue",
+					ip, maskBits(ipNet.Mask), metricValue)
 				_, err = runCommand(psCmd)
 				if err != nil {
 					return fmt.Errorf("添加路由失败: %v", err)
@@ -854,12 +953,12 @@ func addRoute(network, tunName string) error {
 
 			// 使用TUN设备IP作为网关
 			// 使用cmd.exe执行route命令，避免在PowerShell中的转义问题
-			cmd := fmt.Sprintf("cmd.exe /c \"route add %s mask %s %s metric 1\"", ip, mask, tunIP)
+			cmd := fmt.Sprintf("cmd.exe /c \"route add %s mask %s %s metric %d\"", ip, mask, tunIP, metricValue)
 			_, err = runCommand(cmd)
 			if err != nil {
 				// 如果失败，尝试使用PowerShell命令
-				psCmd := fmt.Sprintf("New-NetRoute -DestinationPrefix %s/%d -InterfaceAlias '%s' -NextHop %s -RouteMetric 1 -ErrorAction SilentlyContinue",
-					ip, maskBits(ipNet.Mask), tunName, tunIP)
+				psCmd := fmt.Sprintf("New-NetRoute -DestinationPrefix %s/%d -InterfaceAlias '%s' -NextHop %s -RouteMetric %d -ErrorAction SilentlyContinue",
+					ip, maskBits(ipNet.Mask), tunName, tunIP, metricValue)
 				_, err = runCommand(psCmd)
 				if err != nil {
 					return fmt.Errorf("添加路由失败: %v", err)
@@ -871,7 +970,7 @@ func addRoute(network, tunName string) error {
 		verifyCmd := fmt.Sprintf("route print %s", ip)
 		verifyOutput, _ := runCommand(verifyCmd)
 		if strings.Contains(verifyOutput, ip) {
-			log.Printf("路由添加成功: %s", ip)
+			log.Printf("路由添加成功: %s, metric: %d", ip, metricValue)
 		} else {
 			log.Printf("警告: 无法验证路由是否添加成功: %s", ip)
 		}
@@ -1416,5 +1515,153 @@ func testInternetConnection() {
 		log.Printf("HTTP连接测试(Google)失败: %v\n%s", err, truncateOutput(output, 10))
 	} else {
 		log.Printf("HTTP连接测试(Google)成功: %s", output)
+	}
+}
+
+// testNetworkAfterClose 测试关闭VPN后的网络连接
+func testNetworkAfterClose() {
+	log.Printf("测试关闭VPN后的网络连接...")
+
+	// 检查路由表是否正确
+	if runtime.GOOS == "windows" {
+		log.Printf("检查路由表...")
+		cmd := "route print"
+		output, _ := runCommand(cmd)
+		log.Printf("当前路由表(摘要):\n%s", truncateOutput(output, 20))
+
+		// 检查是否有默认路由
+		if strings.Contains(output, "0.0.0.0          0.0.0.0") {
+			log.Printf("发现默认路由，尝试清理...")
+			cmd = "cmd.exe /c \"route delete 0.0.0.0 mask 0.0.0.0\""
+			_, _ = runCommand(cmd)
+		}
+	}
+
+	// 测试DNS解析
+	cmd := "nslookup baidu.com"
+	output, err := runCommand(cmd)
+	if err != nil {
+		log.Printf("关闭VPN后，DNS解析测试失败: %v\n%s", err, truncateOutput(output, 10))
+
+		// 如果DNS解析失败，尝试重置DNS设置
+		if runtime.GOOS == "windows" {
+			log.Printf("尝试重置DNS设置...")
+
+			// 获取所有网络适配器
+			cmd = "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object -ExpandProperty ifIndex"
+			output, _ = runCommand(cmd)
+			indices := strings.Split(strings.TrimSpace(output), "\n")
+
+			// 重置所有适配器的DNS设置
+			for _, index := range indices {
+				index = strings.TrimSpace(index)
+				if index != "" {
+					cmd = fmt.Sprintf("Set-DnsClientServerAddress -InterfaceIndex %s -ResetServerAddresses", index)
+					_, _ = runCommand(cmd)
+				}
+			}
+
+			// 刷新DNS缓存
+			cmd = "ipconfig /flushdns"
+			_, _ = runCommand(cmd)
+
+			// 重新测试DNS解析
+			cmd = "nslookup baidu.com"
+			output, err = runCommand(cmd)
+			if err != nil {
+				log.Printf("重置DNS后，DNS解析仍然失败: %v\n%s", err, truncateOutput(output, 10))
+
+				// 尝试重启网络服务
+				log.Printf("尝试重启网络服务...")
+				cmd = "Restart-Service -Name Dnscache -Force"
+				_, _ = runCommand(cmd)
+
+				// 等待服务重启
+				time.Sleep(2 * time.Second)
+
+				// 再次测试DNS解析
+				cmd = "nslookup baidu.com"
+				output, err = runCommand(cmd)
+				if err != nil {
+					log.Printf("重启网络服务后，DNS解析仍然失败: %v\n%s", err, truncateOutput(output, 10))
+
+					// 尝试重启物理网络适配器
+					log.Printf("尝试重启物理网络适配器...")
+
+					// 获取物理网络适配器
+					cmd = "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*' -and $_.InterfaceDescription -notlike '*TAP-Windows*'} | Select-Object -ExpandProperty Name"
+					output, _ = runCommand(cmd)
+					adapters := strings.Split(strings.TrimSpace(output), "\n")
+
+					// 重新启用物理网络适配器
+					for _, adapter := range adapters {
+						adapter = strings.TrimSpace(adapter)
+						if adapter != "" {
+							cmd = fmt.Sprintf("Restart-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
+							_, _ = runCommand(cmd)
+							log.Printf("已重新启用网络适配器: %s", adapter)
+						}
+					}
+
+					// 等待网络适配器重启
+					time.Sleep(5 * time.Second)
+
+					// 再次测试DNS解析
+					cmd = "nslookup baidu.com"
+					output, err = runCommand(cmd)
+					if err != nil {
+						log.Printf("重启网络适配器后，DNS解析仍然失败: %v\n%s", err, truncateOutput(output, 10))
+						log.Printf("请手动重启网络适配器或重启电脑以恢复网络连接")
+
+						// 显示网络恢复指南
+						log.Printf("\n\n网络恢复指南:\n1. 请尝试手动执行以下命令:\n   - ipconfig /flushdns\n   - netsh winsock reset\n   - netsh int ip reset\n2. 重启网络适配器\n3. 如果仍然无法连接，请重启电脑\n")
+					} else {
+						log.Printf("重启网络适配器后，DNS解析成功")
+					}
+				} else {
+					log.Printf("重启网络服务后，DNS解析成功")
+				}
+			} else {
+				log.Printf("重置DNS后，DNS解析成功")
+			}
+		}
+	} else {
+		log.Printf("关闭VPN后，DNS解析测试成功")
+
+		// 测试HTTP连接
+		cmd = "curl -s -o nul -w \"HTTP状态码: %{http_code}\" https://www.baidu.com"
+		output, err = runCommand(cmd)
+		if err != nil {
+			log.Printf("关闭VPN后，HTTP连接测试失败: %v\n%s", err, truncateOutput(output, 10))
+
+			// 尝试重置网络设置
+			if runtime.GOOS == "windows" {
+				log.Printf("尝试重置网络设置...")
+
+				// 重置Winsock
+				cmd = "netsh winsock reset"
+				_, _ = runCommand(cmd)
+				log.Printf("已重置Winsock")
+
+				// 重置IP协议栈
+				cmd = "netsh int ip reset"
+				_, _ = runCommand(cmd)
+				log.Printf("已重置IP协议栈")
+
+				// 重新测试HTTP连接
+				cmd = "curl -s -o nul -w \"HTTP状态码: %{http_code}\" https://www.baidu.com"
+				output, err = runCommand(cmd)
+				if err != nil {
+					log.Printf("重置网络设置后，HTTP连接仍然失败: %v\n%s", err, truncateOutput(output, 10))
+					log.Printf("请手动重启网络适配器或重启电脑以恢复网络连接")
+				} else {
+					log.Printf("重置网络设置后，HTTP连接成功: %s", output)
+					log.Printf("网络连接已恢复正常")
+				}
+			}
+		} else {
+			log.Printf("关闭VPN后，HTTP连接测试成功: %s", output)
+			log.Printf("网络连接已恢复正常")
+		}
 	}
 }
