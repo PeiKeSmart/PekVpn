@@ -10,14 +10,14 @@ import (
 
 // DNSProxy 实现一个简单的DNS代理，根据域名选择不同的DNS服务器
 type DNSProxy struct {
-	listenAddr     string
-	chinaDNS       []string
-	foreignDNS     []string
-	chinaDomains   []string
-	mutex          sync.RWMutex
-	running        bool
-	conn           *net.UDPConn
-	stopChan       chan struct{}
+	listenAddr   string
+	chinaDNS     []string
+	foreignDNS   []string
+	chinaDomains []string
+	mutex        sync.RWMutex
+	running      bool
+	conn         *net.UDPConn
+	stopChan     chan struct{}
 }
 
 // NewDNSProxy 创建一个新的DNS代理
@@ -107,7 +107,7 @@ func (p *DNSProxy) handleRequests() {
 
 			// 解析DNS请求，提取域名
 			domain := p.extractDomain(buffer[:n])
-			
+
 			// 根据域名选择DNS服务器
 			var dnsServer string
 			if p.isChinaDomain(domain) {
@@ -126,8 +126,7 @@ func (p *DNSProxy) handleRequests() {
 
 // extractDomain 从DNS请求中提取域名
 func (p *DNSProxy) extractDomain(request []byte) string {
-	// 这是一个简化的实现，实际上需要解析DNS协议
-	// 这里仅作为示例，实际使用时需要完整解析DNS请求
+	// 解析DNS协议以提取域名
 	if len(request) < 12 {
 		return ""
 	}
@@ -136,6 +135,7 @@ func (p *DNSProxy) extractDomain(request []byte) string {
 	pos := 12
 
 	// 读取查询部分
+	var domain strings.Builder
 	for pos < len(request) {
 		// 读取标签长度
 		labelLen := int(request[pos])
@@ -143,12 +143,31 @@ func (p *DNSProxy) extractDomain(request []byte) string {
 			break
 		}
 
+		// 移动到标签内容
+		pos++
+
+		// 读取标签内容
+		if pos+labelLen > len(request) {
+			return ""
+		}
+
+		// 添加标签内容
+		if domain.Len() > 0 {
+			domain.WriteByte('.')
+		}
+		domain.Write(request[pos : pos+labelLen])
+
 		// 移动到下一个标签
-		pos += labelLen + 1
+		pos += labelLen
 	}
 
-	// 简单返回一个占位符
-	return "example.com"
+	domainStr := domain.String()
+	if domainStr == "" {
+		// 如果无法提取域名，返回默认值
+		return "unknown.com"
+	}
+
+	return domainStr
 }
 
 // isChinaDomain 判断是否为中国域名

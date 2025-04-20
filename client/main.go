@@ -246,8 +246,7 @@ func main() {
 		if err == nil {
 			serverIP := net.ParseIP(host)
 			if serverIP != nil && !serverIP.IsLoopback() {
-				deleteCmd := fmt.Sprintf("route delete %s", serverIP.String())
-				_, _ = runCommand(deleteCmd)
+				deleteRoute(serverIP.String())
 				log.Printf("已清理服务器特殊路由: %s", serverIP.String())
 			}
 		}
@@ -255,19 +254,21 @@ func main() {
 		// 清理VPN网段路由
 		log.Printf("正在清理VPN网段路由...")
 		_, ipNet, _ := net.ParseCIDR(config.AllowedIPs[0].String())
-		ip := ipNet.IP.String()
-		mask := net.IP(ipNet.Mask).String()
-		cmd := fmt.Sprintf("cmd.exe /c \"route delete %s mask %s\"", ip, mask)
-		_, _ = runCommand(cmd)
-		log.Printf("已清理VPN网段路由")
+		deleteRoute(ipNet.String())
+		log.Printf("已清理VPN网段路由: %s", ipNet.String())
 
 		// 清理默认路由（如果启用了全局模式）
 		if *fullTunnel {
 			log.Printf("正在清理默认路由...")
-			cmd = "cmd.exe /c \"route delete 0.0.0.0 mask 0.0.0.0\""
-			_, _ = runCommand(cmd)
+			deleteRoute("0.0.0.0/0")
 			log.Printf("已清理默认路由")
 		}
+
+		// 验证路由是否清理成功
+		log.Printf("验证路由清理结果...")
+		checkCmd := "route print"
+		routeOutput, _ := runCommand(checkCmd)
+		log.Printf("当前路由表(摘要):\n%s", truncateOutput(routeOutput, 20))
 
 		// 等待一下，确保路由清理生效
 		time.Sleep(500 * time.Millisecond)
@@ -879,6 +880,25 @@ func maskBits(mask net.IPMask) int {
 func addRoute(network, tunName string) error {
 	log.Printf("正在添加路由: %s 通过 %s", network, tunName)
 
+	// 最多重试3次
+	for i := 0; i < 3; i++ {
+		err := doAddRoute(network, tunName)
+		if err == nil {
+			// 验证路由是否添加成功
+			if verifyRoute(network) {
+				return nil
+			}
+			log.Printf("路由添加成功但验证失败，尝试重新添加: %s (尝试 %d/3)", network, i+1)
+		} else {
+			log.Printf("添加路由失败，尝试重新添加: %s, 错误: %v (尝试 %d/3)", network, err, i+1)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("添加路由失败，已重试3次: %s", network)
+}
+
+// doAddRoute 实际添加路由的函数
+func doAddRoute(network, tunName string) error {
 	// 根据操作系统添加路由
 	switch runtime.GOOS {
 	case "linux":
@@ -966,19 +986,109 @@ func addRoute(network, tunName string) error {
 			}
 		}
 
-		// 验证路由是否添加成功
-		verifyCmd := fmt.Sprintf("route print %s", ip)
-		verifyOutput, _ := runCommand(verifyCmd)
-		if strings.Contains(verifyOutput, ip) {
-			log.Printf("路由添加成功: %s, metric: %d", ip, metricValue)
-		} else {
-			log.Printf("警告: 无法验证路由是否添加成功: %s", ip)
-		}
-
 		return nil
 
 	default:
 		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
+
+// verifyRoute 验证路由是否添加成功
+func verifyRoute(network string) bool {
+	// 解析网络
+	_, ipNet, err := net.ParseCIDR(network)
+	if err != nil {
+		return false
+	}
+
+	ip := ipNet.IP.String()
+
+	// 验证路由
+	verifyCmd := fmt.Sprintf("route print %s", ip)
+	verifyOutput, err := runCommand(verifyCmd)
+	if err != nil {
+		log.Printf("验证路由失败: %v", err)
+		return false
+	}
+
+	if strings.Contains(verifyOutput, ip) {
+		log.Printf("路由验证成功: %s", ip)
+		return true
+	} else {
+		log.Printf("路由验证失败: %s", ip)
+		return false
+	}
+}
+
+// deleteRoute 删除路由
+func deleteRoute(network string) bool {
+	log.Printf("正在删除路由: %s", network)
+
+	// 最多重试3次
+	for i := 0; i < 3; i++ {
+		success := doDeleteRoute(network)
+		if success {
+			return true
+		}
+		log.Printf("删除路由失败，尝试重新删除: %s (尝试 %d/3)", network, i+1)
+		time.Sleep(500 * time.Millisecond)
+	}
+	log.Printf("删除路由失败，已重试3次: %s", network)
+	return false
+}
+
+// doDeleteRoute 实际删除路由的函数
+func doDeleteRoute(network string) bool {
+	switch runtime.GOOS {
+	case "linux":
+		cmd := fmt.Sprintf("ip route del %s", network)
+		_, err := runCommand(cmd)
+		return err == nil
+
+	case "darwin": // macOS
+		cmd := fmt.Sprintf("route delete -net %s", network)
+		_, err := runCommand(cmd)
+		return err == nil
+
+	case "windows":
+		// 解析网络和掩码
+		_, ipNet, err := net.ParseCIDR(network)
+		if err != nil {
+			// 如果不是CIDR格式，尝试直接删除
+			cmd := fmt.Sprintf("cmd.exe /c \"route delete %s\"", network)
+			_, err := runCommand(cmd)
+			return err == nil
+		}
+
+		ip := ipNet.IP.String()
+		mask := net.IP(ipNet.Mask).String()
+
+		// 判断是否是默认路由
+		if ip == "0.0.0.0" && mask == "0.0.0.0" {
+			// 删除默认路由
+			cmd := "cmd.exe /c \"route delete 0.0.0.0 mask 0.0.0.0\""
+			_, err := runCommand(cmd)
+			return err == nil
+		}
+
+		// 删除普通路由
+		cmd := fmt.Sprintf("cmd.exe /c \"route delete %s mask %s\"", ip, mask)
+		_, err = runCommand(cmd)
+		if err != nil {
+			// 如果失败，尝试使用PowerShell命令
+			psCmd := fmt.Sprintf("Remove-NetRoute -DestinationPrefix %s/%d -Confirm:$false -ErrorAction SilentlyContinue",
+				ip, maskBits(ipNet.Mask))
+			_, _ = runCommand(psCmd)
+
+			// 再次验证是否删除成功
+			verifyCmd := fmt.Sprintf("route print %s", ip)
+			verifyOutput, _ := runCommand(verifyCmd)
+			return !strings.Contains(verifyOutput, ip)
+		}
+		return true
+
+	default:
+		return false
 	}
 }
 
@@ -1380,6 +1490,46 @@ func optimizeTCPParameters() {
 func configureDNS(tunName string) error {
 	log.Printf("正在配置DNS服务器...")
 
+	// 设置DNS
+	err := doConfigureDNS(tunName)
+	if err != nil {
+		log.Printf("使用主要方法配置DNS失败: %v，尝试备用方法", err)
+		err = doConfigureDNSAlternative(tunName)
+		if err != nil {
+			return fmt.Errorf("配置DNS服务器失败: %v", err)
+		}
+	}
+
+	// 验证DNS设置
+	if !verifyDNS() {
+		log.Printf("DNS设置验证失败，尝试使用备用方法")
+		err = doConfigureDNSAlternative(tunName)
+		if err != nil {
+			return fmt.Errorf("使用备用方法配置DNS失败: %v", err)
+		}
+
+		if !verifyDNS() {
+			log.Printf("DNS设置仍然验证失败，尝试刷新DNS缓存")
+			flushDNSCache()
+
+			if !verifyDNS() {
+				log.Printf("DNS设置验证仍然失败，可能需要手动配置DNS")
+				// 即使验证失败也继续，不返回错误
+			} else {
+				log.Printf("DNS设置验证成功")
+			}
+		} else {
+			log.Printf("DNS设置验证成功")
+		}
+	} else {
+		log.Printf("DNS设置验证成功")
+	}
+
+	return nil
+}
+
+// doConfigureDNS 主要的DNS配置方法
+func doConfigureDNS(tunName string) error {
 	switch runtime.GOOS {
 	case "windows":
 		// 获取TUN接口索引
@@ -1398,24 +1548,13 @@ func configureDNS(tunName string) error {
 		cmd = fmt.Sprintf("Set-DnsClientServerAddress -InterfaceIndex %s -ServerAddresses '8.8.8.8','8.8.4.4'", ifIndex) // Google DNS
 		_, err = runCommand(cmd)
 		if err != nil {
-			log.Printf("使用PowerShell配置DNS服务器失败: %v", err)
-
-			// 尝试使用netsh命令配置DNS
-			cmd = fmt.Sprintf("netsh interface ip set dns name=\"%s\" static 8.8.8.8 primary", tunName) // Google DNS
-			_, err = runCommand(cmd)
-			if err != nil {
-				return fmt.Errorf("配置DNS服务器失败: %v", err)
-			}
-
-			cmd = fmt.Sprintf("netsh interface ip add dns name=\"%s\" 8.8.4.4 index=2", tunName) // Google DNS
-			_, _ = runCommand(cmd)
+			return fmt.Errorf("使用PowerShell配置DNS服务器失败: %v", err)
 		}
 
 		log.Printf("已为接口%s配置DNS服务器", tunName)
 
 		// 刷新DNS缓存
-		cmd = "ipconfig /flushdns"
-		_, _ = runCommand(cmd)
+		flushDNSCache()
 
 		return nil
 
@@ -1439,6 +1578,105 @@ func configureDNS(tunName string) error {
 
 	default:
 		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
+
+// doConfigureDNSAlternative 备用的DNS配置方法
+func doConfigureDNSAlternative(tunName string) error {
+	switch runtime.GOOS {
+	case "windows":
+		// 尝试使用netsh命令配置DNS
+		cmd := fmt.Sprintf("netsh interface ip set dns name=\"%s\" static 8.8.8.8 primary", tunName) // Google DNS
+		_, err := runCommand(cmd)
+		if err != nil {
+			return fmt.Errorf("使用netsh配置DNS服务器失败: %v", err)
+		}
+
+		cmd = fmt.Sprintf("netsh interface ip add dns name=\"%s\" 8.8.4.4 index=2", tunName) // Google DNS
+		_, _ = runCommand(cmd)
+
+		log.Printf("已使用netsh为接口%s配置DNS服务器", tunName)
+
+		// 刷新DNS缓存
+		flushDNSCache()
+
+		return nil
+
+	case "linux":
+		// 在Linux上使用其他方法修改DNS
+		cmd := "echo 'nameserver 8.8.8.8\nnameserver 8.8.4.4' | sudo tee /etc/resolv.conf" // Google DNS
+		_, err := runCommand(cmd)
+		if err != nil {
+			return fmt.Errorf("配置DNS服务器失败: %v", err)
+		}
+		return nil
+
+	case "darwin": // macOS
+		// 在macOS上使用其他方法配置DNS
+		cmd := fmt.Sprintf("sudo networksetup -setdnsservers %s 8.8.8.8 8.8.4.4", tunName) // Google DNS
+		_, err := runCommand(cmd)
+		if err != nil {
+			return fmt.Errorf("配置DNS服务器失败: %v", err)
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
+
+// verifyDNS 验证DNS设置
+func verifyDNS() bool {
+	// 尝试解析一个域名
+	cmd := "nslookup google.com"
+	_, err := runCommand(cmd)
+	if err != nil {
+		log.Printf("DNS验证失败: %v", err)
+		return false
+	}
+
+	// 尝试解析另一个域名
+	cmd = "nslookup baidu.com"
+	_, err = runCommand(cmd)
+	if err != nil {
+		log.Printf("DNS验证失败: %v", err)
+		return false
+	}
+
+	return true
+}
+
+// flushDNSCache 刷新DNS缓存
+func flushDNSCache() {
+	switch runtime.GOOS {
+	case "windows":
+		cmd := "ipconfig /flushdns"
+		_, err := runCommand(cmd)
+		if err != nil {
+			log.Printf("刷新DNS缓存失败: %v", err)
+		} else {
+			log.Printf("已刷新DNS缓存")
+		}
+
+	case "linux":
+		// 在Linux上刷新DNS缓存
+		cmd := "sudo systemctl restart systemd-resolved"
+		_, err := runCommand(cmd)
+		if err != nil {
+			log.Printf("刷新DNS缓存失败: %v", err)
+		} else {
+			log.Printf("已刷新DNS缓存")
+		}
+
+	case "darwin": // macOS
+		// 在macOS上刷新DNS缓存
+		cmd := "sudo killall -HUP mDNSResponder"
+		_, err := runCommand(cmd)
+		if err != nil {
+			log.Printf("刷新DNS缓存失败: %v", err)
+		} else {
+			log.Printf("已刷新DNS缓存")
+		}
 	}
 }
 
@@ -1518,9 +1756,133 @@ func testInternetConnection() {
 	}
 }
 
+// isNetworkConnected 检查网络连接状态
+func isNetworkConnected() bool {
+	// 尝试访问百度
+	cmd := "curl -s -o nul -w \"%{http_code}\" https://www.baidu.com"
+	output, err := runCommand(cmd)
+	if err != nil {
+		log.Printf("网络连接检测失败: %v", err)
+		return false
+	}
+
+	return strings.Contains(output, "200")
+}
+
+// resetDNS 重置DNS设置
+func resetDNS() bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+
+	log.Printf("尝试重置DNS设置...")
+
+	// 获取所有网络适配器
+	cmd := "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object -ExpandProperty ifIndex"
+	output, _ := runCommand(cmd)
+	indices := strings.Split(strings.TrimSpace(output), "\n")
+
+	// 重置所有适配器的DNS设置
+	for _, index := range indices {
+		index = strings.TrimSpace(index)
+		if index != "" {
+			cmd = fmt.Sprintf("Set-DnsClientServerAddress -InterfaceIndex %s -ResetServerAddresses", index)
+			_, _ = runCommand(cmd)
+		}
+	}
+
+	// 刷新DNS缓存
+	cmd = "ipconfig /flushdns"
+	_, _ = runCommand(cmd)
+	log.Printf("已刷新DNS缓存")
+
+	// 验证DNS设置
+	return verifyDNS()
+}
+
+// restartDNSService 重启DNS服务
+func restartDNSService() bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+
+	log.Printf("尝试重启DNS服务...")
+	cmd := "Restart-Service -Name Dnscache -Force"
+	_, _ = runCommand(cmd)
+
+	// 等待服务重启
+	time.Sleep(2 * time.Second)
+
+	// 验证DNS设置
+	return verifyDNS()
+}
+
+// restartNetworkAdapters 重启网络适配器
+func restartNetworkAdapters() bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+
+	log.Printf("尝试重启网络适配器...")
+
+	// 获取物理网络适配器
+	cmd := "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*' -and $_.InterfaceDescription -notlike '*TAP-Windows*'} | Select-Object -ExpandProperty Name"
+	output, _ := runCommand(cmd)
+	adapters := strings.Split(strings.TrimSpace(output), "\n")
+
+	// 重新启用物理网络适配器
+	for _, adapter := range adapters {
+		adapter = strings.TrimSpace(adapter)
+		if adapter != "" {
+			cmd = fmt.Sprintf("Restart-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
+			_, _ = runCommand(cmd)
+			log.Printf("已重新启用网络适配器: %s", adapter)
+		}
+	}
+
+	// 等待网络适配器重启
+	time.Sleep(5 * time.Second)
+
+	// 验证网络连接
+	return isNetworkConnected()
+}
+
+// resetNetworkStack 重置网络协议栈
+func resetNetworkStack() bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+
+	log.Printf("尝试重置网络协议栈...")
+
+	// 重置Winsock
+	cmd := "netsh winsock reset"
+	_, _ = runCommand(cmd)
+	log.Printf("已重置Winsock")
+
+	// 重置IP协议栈
+	cmd = "netsh int ip reset"
+	_, _ = runCommand(cmd)
+	log.Printf("已重置IP协议栈")
+
+	// 等待重置生效
+	time.Sleep(2 * time.Second)
+
+	// 验证网络连接
+	return isNetworkConnected()
+}
+
 // testNetworkAfterClose 测试关闭VPN后的网络连接
 func testNetworkAfterClose() {
 	log.Printf("测试关闭VPN后的网络连接...")
+
+	// 检查网络连接状态
+	if isNetworkConnected() {
+		log.Printf("网络连接正常，无需恢复")
+		return
+	}
+
+	log.Printf("网络连接异常，尝试恢复")
 
 	// 检查路由表是否正确
 	if runtime.GOOS == "windows" {
@@ -1532,136 +1894,39 @@ func testNetworkAfterClose() {
 		// 检查是否有默认路由
 		if strings.Contains(output, "0.0.0.0          0.0.0.0") {
 			log.Printf("发现默认路由，尝试清理...")
-			cmd = "cmd.exe /c \"route delete 0.0.0.0 mask 0.0.0.0\""
-			_, _ = runCommand(cmd)
+			deleteRoute("0.0.0.0/0")
 		}
 	}
 
-	// 测试DNS解析
-	cmd := "nslookup baidu.com"
-	output, err := runCommand(cmd)
-	if err != nil {
-		log.Printf("关闭VPN后，DNS解析测试失败: %v\n%s", err, truncateOutput(output, 10))
-
-		// 如果DNS解析失败，尝试重置DNS设置
-		if runtime.GOOS == "windows" {
-			log.Printf("尝试重置DNS设置...")
-
-			// 获取所有网络适配器
-			cmd = "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object -ExpandProperty ifIndex"
-			output, _ = runCommand(cmd)
-			indices := strings.Split(strings.TrimSpace(output), "\n")
-
-			// 重置所有适配器的DNS设置
-			for _, index := range indices {
-				index = strings.TrimSpace(index)
-				if index != "" {
-					cmd = fmt.Sprintf("Set-DnsClientServerAddress -InterfaceIndex %s -ResetServerAddresses", index)
-					_, _ = runCommand(cmd)
-				}
-			}
-
-			// 刷新DNS缓存
-			cmd = "ipconfig /flushdns"
-			_, _ = runCommand(cmd)
-
-			// 重新测试DNS解析
-			cmd = "nslookup baidu.com"
-			output, err = runCommand(cmd)
-			if err != nil {
-				log.Printf("重置DNS后，DNS解析仍然失败: %v\n%s", err, truncateOutput(output, 10))
-
-				// 尝试重启网络服务
-				log.Printf("尝试重启网络服务...")
-				cmd = "Restart-Service -Name Dnscache -Force"
-				_, _ = runCommand(cmd)
-
-				// 等待服务重启
-				time.Sleep(2 * time.Second)
-
-				// 再次测试DNS解析
-				cmd = "nslookup baidu.com"
-				output, err = runCommand(cmd)
-				if err != nil {
-					log.Printf("重启网络服务后，DNS解析仍然失败: %v\n%s", err, truncateOutput(output, 10))
-
-					// 尝试重启物理网络适配器
-					log.Printf("尝试重启物理网络适配器...")
-
-					// 获取物理网络适配器
-					cmd = "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*' -and $_.InterfaceDescription -notlike '*TAP-Windows*'} | Select-Object -ExpandProperty Name"
-					output, _ = runCommand(cmd)
-					adapters := strings.Split(strings.TrimSpace(output), "\n")
-
-					// 重新启用物理网络适配器
-					for _, adapter := range adapters {
-						adapter = strings.TrimSpace(adapter)
-						if adapter != "" {
-							cmd = fmt.Sprintf("Restart-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
-							_, _ = runCommand(cmd)
-							log.Printf("已重新启用网络适配器: %s", adapter)
-						}
-					}
-
-					// 等待网络适配器重启
-					time.Sleep(5 * time.Second)
-
-					// 再次测试DNS解析
-					cmd = "nslookup baidu.com"
-					output, err = runCommand(cmd)
-					if err != nil {
-						log.Printf("重启网络适配器后，DNS解析仍然失败: %v\n%s", err, truncateOutput(output, 10))
-						log.Printf("请手动重启网络适配器或重启电脑以恢复网络连接")
-
-						// 显示网络恢复指南
-						log.Printf("\n\n网络恢复指南:\n1. 请尝试手动执行以下命令:\n   - ipconfig /flushdns\n   - netsh winsock reset\n   - netsh int ip reset\n2. 重启网络适配器\n3. 如果仍然无法连接，请重启电脑\n")
-					} else {
-						log.Printf("重启网络适配器后，DNS解析成功")
-					}
-				} else {
-					log.Printf("重启网络服务后，DNS解析成功")
-				}
-			} else {
-				log.Printf("重置DNS后，DNS解析成功")
-			}
-		}
-	} else {
-		log.Printf("关闭VPN后，DNS解析测试成功")
-
-		// 测试HTTP连接
-		cmd = "curl -s -o nul -w \"HTTP状态码: %{http_code}\" https://www.baidu.com"
-		output, err = runCommand(cmd)
-		if err != nil {
-			log.Printf("关闭VPN后，HTTP连接测试失败: %v\n%s", err, truncateOutput(output, 10))
-
-			// 尝试重置网络设置
-			if runtime.GOOS == "windows" {
-				log.Printf("尝试重置网络设置...")
-
-				// 重置Winsock
-				cmd = "netsh winsock reset"
-				_, _ = runCommand(cmd)
-				log.Printf("已重置Winsock")
-
-				// 重置IP协议栈
-				cmd = "netsh int ip reset"
-				_, _ = runCommand(cmd)
-				log.Printf("已重置IP协议栈")
-
-				// 重新测试HTTP连接
-				cmd = "curl -s -o nul -w \"HTTP状态码: %{http_code}\" https://www.baidu.com"
-				output, err = runCommand(cmd)
-				if err != nil {
-					log.Printf("重置网络设置后，HTTP连接仍然失败: %v\n%s", err, truncateOutput(output, 10))
-					log.Printf("请手动重启网络适配器或重启电脑以恢复网络连接")
-				} else {
-					log.Printf("重置网络设置后，HTTP连接成功: %s", output)
-					log.Printf("网络连接已恢复正常")
-				}
-			}
-		} else {
-			log.Printf("关闭VPN后，HTTP连接测试成功: %s", output)
-			log.Printf("网络连接已恢复正常")
-		}
+	// 尝试重置DNS
+	if resetDNS() && isNetworkConnected() {
+		log.Printf("重置DNS后，网络连接已恢复")
+		return
 	}
+
+	// 尝试重启DNS服务
+	if restartDNSService() && isNetworkConnected() {
+		log.Printf("重启DNS服务后，网络连接已恢复")
+		return
+	}
+
+	// 尝试重启网络适配器
+	if restartNetworkAdapters() && isNetworkConnected() {
+		log.Printf("重启网络适配器后，网络连接已恢复")
+		return
+	}
+
+	// 尝试重置网络协议栈
+	if resetNetworkStack() && isNetworkConnected() {
+		log.Printf("重置网络协议栈后，网络连接已恢复")
+		return
+	}
+
+	// 如果所有尝试都失败，提供恢复指南
+	log.Printf("自动恢复失败，请按照以下步骤手动恢复网络连接:")
+	log.Printf("1. 执行 ipconfig /flushdns")
+	log.Printf("2. 执行 netsh winsock reset")
+	log.Printf("3. 执行 netsh int ip reset")
+	log.Printf("4. 重启网络适配器")
+	log.Printf("5. 如果仍然无法连接，请重启电脑")
 }
