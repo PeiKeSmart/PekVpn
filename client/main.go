@@ -170,8 +170,9 @@ func main() {
 				deleteCmd := fmt.Sprintf("route delete %s", serverIP.String())
 				_, _ = runCommand(deleteCmd)
 
-				// 添加服务器特殊路由，使用默认网关，使用最低的metric值(0)确保最高优先级
-				addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask 255.255.255.255 %s metric 0\"", serverIP.String(), defaultGateway)
+				// 添加服务器特殊路由，使用默认网关，使用最低的metric值(1)确保最高优先级
+				// Windows不支持metric值为0，最小值为1
+				addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask 255.255.255.255 %s metric 1\"", serverIP.String(), defaultGateway)
 				_, err = runCommand(addCmd)
 				if err == nil {
 					log.Printf("已添加服务器特殊路由: %s -> %s (优先级最高)", serverIP.String(), defaultGateway)
@@ -214,7 +215,7 @@ func main() {
 
 				if defaultGateway != "" {
 					// 再次尝试添加路由
-					addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask 255.255.255.255 %s metric 0\"", serverIP.String(), defaultGateway)
+					addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask 255.255.255.255 %s metric 1\"", serverIP.String(), defaultGateway)
 					_, _ = runCommand(addCmd)
 					log.Printf("再次添加服务器特殊路由: %s -> %s", serverIP.String(), defaultGateway)
 				}
@@ -1109,6 +1110,7 @@ func doAddRoute(network, tunName string) error {
 		isDefaultRoute := (ip == "0.0.0.0" && mask == "0.0.0.0")
 
 		// 设置metric值，默认路由使用更高的metric值，确保服务器特殊路由优先级更高
+		// Windows不支持metric值为0，最小值为1
 		metricValue := 1
 		if isDefaultRoute {
 			metricValue = 10
