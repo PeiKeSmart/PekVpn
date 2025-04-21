@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
@@ -72,14 +73,34 @@ func (s *SocksManager) monitorConnection() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
+	// 设置连续失败计数器
+	failureCount := 0
+	const maxFailures = 3 // 最大连续失败次数
+
 	for {
 		select {
 		case <-ticker.C:
 			// 定期测试连接
 			err := s.TestConnection()
 			if err != nil {
-				s.logger.Printf("警告: SOCKS代理连接测试失败: %v", err)
+				failureCount++
+				s.logger.Printf("警告: SOCKS代理连接测试失败 (%d/%d): %v", failureCount, maxFailures, err)
+
+				// 如果连续失败超过最大次数，设置为非运行状态
+				if failureCount >= maxFailures {
+					s.running = false
+					s.logger.Printf("警告: SOCKS代理连续%d次连接失败，已标记为非运行状态", maxFailures)
+					s.logger.Printf("注意: 这不会影响VPN的基本功能，只是无法使用SOCKS代理")
+				}
 			} else {
+				// 测试成功，重置失败计数器
+				failureCount = 0
+
+				// 如果之前不是运行状态，输出日志
+				if !s.running {
+					s.logger.Printf("SOCKS代理连接恢复正常")
+				}
+
 				s.running = true
 			}
 		case <-s.monitorChan:
@@ -87,12 +108,17 @@ func (s *SocksManager) monitorConnection() {
 			err := s.TestConnection()
 			if err != nil {
 				s.logger.Printf("警告: SOCKS代理连接测试失败: %v", err)
+				s.logger.Printf("注意: 这不会影响VPN的基本功能，只是无法使用SOCKS代理")
+				s.running = false
 			} else {
 				s.running = true
 				s.logger.Printf("SOCKS代理连接测试成功")
+				// 重置失败计数器
+				failureCount = 0
 			}
 		case <-s.stopChan:
 			// 停止监控
+			s.logger.Printf("SOCKS代理连接监控已停止")
 			return
 		}
 	}
@@ -115,14 +141,58 @@ func (s *SocksManager) TestConnection() error {
 		return fmt.Errorf("创建SOCKS5代理拨号器失败: %v", err)
 	}
 
-	// 尝试连接到一个测试网站
-	conn, err := dialer.Dial("tcp", "www.google.com:80")
-	if err != nil {
-		return fmt.Errorf("通过SOCKS5代理连接失败: %v", err)
-	}
-	defer conn.Close()
+	// 创建一个带超时的上下文
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	return nil
+	// 使用通道来控制超时
+	resultChan := make(chan error, 1)
+
+	// 在单独的goroutine中执行连接测试
+	go func() {
+		// 尝试连接到一个测试网站（使用百度而非Google，因为在中国大陆可以访问）
+		conn, err := dialer.Dial("tcp", "www.baidu.com:80")
+		if err != nil {
+			resultChan <- fmt.Errorf("通过SOCKS5代理连接失败: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		// 发送简单的HTTP请求来确认连接成功
+		_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: www.baidu.com\r\nConnection: close\r\n\r\n"))
+		if err != nil {
+			resultChan <- fmt.Errorf("发送HTTP请求失败: %v", err)
+			return
+		}
+
+		// 设置读取超时
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+
+		// 读取响应头部
+		buf := make([]byte, 1024)
+		_, err = conn.Read(buf)
+		if err != nil {
+			resultChan <- fmt.Errorf("读取HTTP响应失败: %v", err)
+			return
+		}
+
+		// 检查是否收到HTTP响应
+		if !strings.Contains(string(buf), "HTTP/1.") {
+			resultChan <- fmt.Errorf("收到的响应不是有效的HTTP响应")
+			return
+		}
+
+		// 测试成功
+		resultChan <- nil
+	}()
+
+	// 等待测试结果或超时
+	select {
+	case err := <-resultChan:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("测试SOCKS代理连接超时，请检查服务器是否已启用SOCKS代理")
+	}
 }
 
 // TriggerTest 触发连接测试
@@ -263,4 +333,54 @@ func getHostsFilePath() string {
 // isWindows 检查是否是Windows系统
 func isWindows() bool {
 	return os.PathSeparator == '\\' && os.PathListSeparator == ';'
+}
+
+// CleanupWebRTCProtection 清理WebRTC保护设置
+func CleanupWebRTCProtection() error {
+	log.Printf("正在清理WebRTC保护设置...")
+
+	// 获取hosts文件路径
+	hostsPath := getHostsFilePath()
+
+	// 读取现有内容
+	content, err := os.ReadFile(hostsPath)
+	if err != nil {
+		return fmt.Errorf("读取hosts文件失败: %v", err)
+	}
+
+	// 将内容转换为字符串
+	hostsContent := string(content)
+
+	// 检查是否包含WebRTC保护标记
+	if !strings.Contains(hostsContent, "# PekHight VPN WebRTC Protection") {
+		// 没有找到标记，不需要清理
+		log.Printf("未找到WebRTC保护设置，无需清理")
+		return nil
+	}
+
+	// 分割文件内容
+	parts := strings.Split(hostsContent, "# PekHight VPN WebRTC Protection")
+	if len(parts) < 2 {
+		return fmt.Errorf("无法解析hosts文件")
+	}
+
+	// 找到下一个注释或文件结尾
+	newContent := parts[0]
+	for i := 1; i < len(parts); i++ {
+		part := parts[i]
+		// 如果这部分包含另一个注释，保留该注释及之后的内容
+		commentPos := strings.Index(part, "#")
+		if commentPos >= 0 {
+			newContent += part[commentPos:]
+		}
+	}
+
+	// 写回文件
+	err = os.WriteFile(hostsPath, []byte(newContent), 0644)
+	if err != nil {
+		return fmt.Errorf("写入hosts文件失败: %v", err)
+	}
+
+	log.Printf("WebRTC保护设置已清理")
+	return nil
 }

@@ -290,12 +290,31 @@ func main() {
 		// 测试SOCKS代理连接
 		go func() {
 			// 等待VPN连接建立
+			log.Printf("SOCKS代理连接测试将在5秒后开始...")
 			time.Sleep(5 * time.Second)
+
+			log.Printf("正在测试SOCKS代理连接到 %s...", socksManager.GetSocksAddr())
 			err := socksManager.TestConnection()
 			if err != nil {
 				log.Printf("SOCKS代理连接测试失败: %v", err)
+				log.Printf("请确保服务器已启用SOCKS代理功能，并且端口号正确")
+				log.Printf("如果问题仍然存在，请检查防火墙设置或网络连接")
+				log.Printf("注意: SOCKS代理连接失败不会影响VPN的基本功能，只是无法使用SOCKS代理")
+
+				// 设置运行状态为失败，但不影响VPN连接
+				socksManager.running = false
 			} else {
-				log.Printf("SOCKS代理连接测试成功，可以在应用程序中使用SOCKS5代理: %s", socksManager.GetSocksAddr())
+				log.Printf("SOCKS代理连接测试成功！")
+				log.Printf("可以在应用程序中使用以下设置:")
+				log.Printf("  - 代理类型: SOCKS5")
+				log.Printf("  - 代理地址: %s", socksManager.GetSocksAddr())
+				if socksManager.username != "" {
+					log.Printf("  - 用户名: %s", socksManager.username)
+					log.Printf("  - 密码: %s", strings.Repeat("*", len(socksManager.password)))
+				}
+
+				// 设置运行状态为成功
+				socksManager.running = true
 			}
 		}()
 	}
@@ -551,7 +570,14 @@ func main() {
 		time.Sleep(3 * time.Second)
 	}
 
-	// 6. 恢复反检测措施
+	// 6. 如果启用了SOCKS代理，停止SOCKS代理管理器
+	if socksManager != nil {
+		log.Printf("正在停止SOCKS代理管理器...")
+		socksManager.Stop()
+		log.Printf("已停止SOCKS代理管理器")
+	}
+
+	// 7. 恢复反检测措施
 	if antiDetectionEnabled {
 		log.Printf("恢复反检测措施...")
 		// 恢复原始Transport
@@ -562,12 +588,17 @@ func main() {
 		antiDetectionEnabled = false
 	}
 
-	// 7. 禁用WebRTC泄露防护
+	// 8. 禁用WebRTC泄露防护
 	if *protectWebRTC {
 		log.Printf("正在禁用WebRTC泄露防护...")
-		// 注意：我们的WebRTC保护是通过hosts文件实现的，
-		// 在这里不需要特别的清理操作，因为系统重启后会自动重新加载原始hosts文件
-		log.Printf("已禁用WebRTC泄露防护，如果需要完全清除，请手动检查hosts文件")
+		// 使用新的清理函数清除hosts文件中的WebRTC保护设置
+		err := CleanupWebRTCProtection()
+		if err != nil {
+			log.Printf("清理WebRTC保护设置失败: %v", err)
+			log.Printf("请手动检查hosts文件，删除'# PekHight VPN WebRTC Protection'开头的部分")
+		} else {
+			log.Printf("已成功清理WebRTC保护设置")
+		}
 	}
 
 	// 8. 测试网络连接是否恢复
