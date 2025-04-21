@@ -24,6 +24,8 @@
 - [x] 支持 DNS 配置和泄露防护
 - [x] 支持自定义 TUN/TAP 设备配置
 - [x] 支持动态 MTU 探测和优化
+- [x] 支持 SOCKS5 代理服务器，解决 Windows 10 路由问题
+- [x] 支持 SOCKS5 代理与 VPN 公钥认证集成，提高安全性
 
 ## 系统要求
 
@@ -148,6 +150,10 @@ pekserver.exe -port 23456 -enable-reg
 - `-client-timeout <分钟>`: 客户端超时时间，超过此时间未响应的客户端将被自动清理，默认为 10 分钟
 - `-auto-cleanup`: 是否自动清理超时的客户端，默认为 true
 - `-amnezia`: 启用 AmneziaWG 特殊修改
+- `-enable-socks`: 是否启用 SOCKS5 代理服务器，默认为 true
+- `-socks-port <端口>`: 指定 SOCKS5 代理服务器端口，默认为 1080
+- `-socks-user <用户名>`: 指定 SOCKS5 代理服务器用户名，留空则不启用认证
+- `-socks-pass <密码>`: 指定 SOCKS5 代理服务器密码，留空则不启用认证
 
 ### 客户端
 
@@ -179,6 +185,10 @@ pekclient.exe -server <服务器地址:端口>
 - `-client-name <名称>`: 指定客户端名称
 - `-config <文件路径>`: 指定配置文件路径（可选）
 - `-full-tunnel`: 启用全局代理模式，默认为 true
+- `-use-tun2socks`: 启用 SOCKS5 代理功能，默认为 true
+- `-socks-port <端口>`: 指定 SOCKS5 代理端口，默认为 1080
+- `-socks-user <用户名>`: 指定 SOCKS5 代理用户名，留空则不启用认证
+- `-socks-pass <密码>`: 指定 SOCKS5 代理密码，留空则不启用认证
 - `-protect-webrtc`: 启用 WebRTC 泄露防护，防止真实 IP 地址泄露
 - `-dns-proxy`: 启用 DNS 代理，防止 DNS 泄露
 - `-amnezia`: 启用 AmneziaWG 特殊修改
@@ -356,7 +366,58 @@ pekclient.exe -server <服务器IP>:23456 -private-key <客户端私钥> -server
 
 ## 高级使用场景
 
-### 场景三：启用 WebRTC 泄露防护
+### 场景三：使用 SOCKS5 代理解决 Windows 10 路由问题
+
+```bash
+# 服务端启动 SOCKS5 代理服务器
+# 使用 Go 直接运行
+cd server
+sudo go run main.go -enable-socks=true -socks-port=1080
+
+# 或者使用编译后的可执行文件
+sudo ./pekserver -enable-socks=true -socks-port=1080
+# Windows
+pekserver.exe -enable-socks=true -socks-port=1080
+```
+
+```bash
+# 客户端启用 SOCKS5 代理功能
+# 使用 Go 直接运行
+cd client
+sudo go run main.go -server <服务器IP>:23456 -use-tun2socks=true -socks-port=1080
+
+# 或者使用编译后的可执行文件
+sudo ./pekclient -server <服务器IP>:23456 -use-tun2socks=true -socks-port=1080
+# Windows
+pekclient.exe -server <服务器IP>:23456 -use-tun2socks=true -socks-port=1080
+```
+
+注意：客户端会自动使用 VPN 公钥生成 SOCKS5 认证信息，无需手动指定用户名和密码。如果需要手动指定，可以使用以下参数：
+
+```bash
+# 服务端指定用户名和密码
+pekserver.exe -enable-socks=true -socks-port=1080 -socks-user=vpnuser -socks-pass=vpnpass
+
+# 客户端指定用户名和密码
+pekclient.exe -server <服务器IP>:23456 -use-tun2socks=true -socks-port=1080 -socks-user=vpnuser -socks-pass=vpnpass
+```
+
+SOCKS5 代理功能特别适用于 Windows 10 系统，可以解决以下问题：
+
+1. **路由转发问题**：Windows 10 家庭版和专业版缺少 Routing and Remote Access 服务，导致 VPN 流量转发失败
+2. **NAT 配置问题**：Windows 10 的 NetNat 功能不稳定，导致转发失败
+3. **兼容性问题**：某些应用程序可能不兼容全局 VPN 模式
+
+使用方法：
+
+1. 启动服务端和客户端，确保启用 SOCKS5 代理功能
+2. 在应用程序中配置 SOCKS5 代理：
+   - 代理地址：服务器 IP 地址
+   - 代理端口：1080（或自定义端口）
+   - 代理类型：SOCKS5
+   - 用户名/密码：如果启用了认证，输入相应的用户名和密码
+
+### 场景四：启用 WebRTC 泄露防护
 
 ```bash
 # 使用 Go 直接运行
@@ -408,6 +469,9 @@ pekserver.exe -client-timeout=30 -auto-cleanup=true
 - [x] 客户端状态监控和自动清理
 - [x] WebRTC 泄露防护
 - [x] DNS 配置和泄露防护
+- [x] SOCKS5 代理服务器支持
+- [x] Windows 10 路由问题解决方案
+- [x] SOCKS5 代理与 VPN 公钥认证集成
 
 ### 计划中功能
 

@@ -30,10 +30,14 @@ var (
 	regSecret     = flag.String("reg-secret", "vpnsecret", "客户端注册密钥")
 	clientTimeout = flag.Int("client-timeout", 10, "客户端超时时间(分钟)，超过此时间未响应的客户端将被自动清理")
 	autoCleanup   = flag.Bool("auto-cleanup", true, "是否自动清理超时的客户端")
+	enableSocks   = flag.Bool("enable-socks", true, "是否启用SOCKS5代理服务器")
+	socksPort     = flag.Int("socks-port", 1080, "SOCKS5代理服务器端口")
+	socksUser     = flag.String("socks-user", "", "SOCKS5代理服务器用户名，留空则不启用认证")
+	socksPass     = flag.String("socks-pass", "", "SOCKS5代理服务器密码，留空则不启用认证")
 
 	// 客户端管理
 	clients     = make(map[wgtypes.Key]*wireguard.PeerInfo)
-	clientsLock sync.Mutex
+	clientsLock sync.RWMutex
 
 	// IP地址分配
 	nextIP = net.ParseIP("10.8.0.2").To4()
@@ -156,6 +160,36 @@ func main() {
 
 	// 启动客户端连接监控
 	go monitorClientConnections(wgDevice)
+
+	// 启动SOCKS5代理服务器
+	if *enableSocks {
+		// 使用注册密钥作为默认密码，如果没有指定密码
+		socksUsername := *socksUser
+		socksPassword := *socksPass
+
+		// 如果没有指定密码但指定了用户名，使用注册密钥作为密码
+		if socksPassword == "" && socksUsername != "" {
+			socksPassword = *regSecret
+			log.Printf("未指定 SOCKS5 密码，使用注册密钥作为密码")
+		}
+
+		// 获取客户端列表的副本，避免并发问题
+		clientsLock.RLock()
+		clientsCopy := make(map[wgtypes.Key]*wireguard.PeerInfo)
+		for k, v := range clients {
+			clientsCopy[k] = v
+		}
+		clientsLock.RUnlock()
+
+		// 启动SOCKS5代理服务器，使用VPN公钥认证
+		socksServer, err := StartSocksServer(*tunIP, *socksPort, socksUsername, socksPassword, *regSecret, clientsCopy)
+		if err != nil {
+			log.Printf("启动SOCKS5代理服务器失败: %v", err)
+		} else {
+			log.Printf("SOCKS5代理服务器已启动在 %s", socksServer.GetBindAddr())
+			defer socksServer.Stop()
+		}
+	}
 
 	// 等待信号
 	sigCh := make(chan os.Signal, 1)

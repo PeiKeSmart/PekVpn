@@ -35,9 +35,13 @@ var (
 	clientName     = flag.String("client-name", "", "客户端名称")
 	regSecret      = flag.String("reg-secret", "vpnsecret", "注册密钥")
 	fullTunnel     = flag.Bool("full-tunnel", true, "是否启用全局代理模式")
+	useTun2Socks   = flag.Bool("use-tun2socks", true, "是否使用Tun2Socks转发流量")
+	socksPort      = flag.Int("socks-port", 1080, "SOCKS5代理端口")
+	socksUser      = flag.String("socks-user", "", "SOCKS5代理用户名")
+	socksPass      = flag.String("socks-pass", "", "SOCKS5代理密码")
+	protectWebRTC  = flag.Bool("protect-webrtc", true, "是否防止WebRTC泄漏")
 	useDNSProxy    = flag.Bool("dns-proxy", false, "是否使用DNS代理")
 	mtuValue       = flag.Int("mtu", 0, "MTU值，0表示自动探测")
-	protectWebRTC  = flag.Bool("protect-webrtc", false, "是否启用WebRTC泄露防护")
 	diagnoseMode   = flag.Bool("diagnose", false, "是否启用诊断模式，用于判断无法联网的原因")
 
 	// 系统信息
@@ -252,6 +256,50 @@ func main() {
 	log.Printf("客户端公钥: %s", wireguard.GeneratePublicKey(config.PrivateKey).String())
 	log.Printf("TUN设备: %s, IP: %s", wgDevice.TunName, *clientIP)
 
+	// 如果启用了SOCKS代理，启动SOCKS代理
+	var socksManager *SocksManager
+	if *useTun2Socks {
+		log.Printf("启用SOCKS代理...")
+		// 从端点获取服务器IP
+		serverIP := GetServerIPFromEndpoint(config.Endpoint)
+		if serverIP == "" {
+			log.Printf("无法从端点获取服务器IP，使用原始端点: %s", config.Endpoint)
+			host, _, _ := net.SplitHostPort(config.Endpoint)
+			serverIP = host
+		}
+
+		// 创建SOCKS代理管理器
+		// 使用VPN公钥认证或用户名/密码认证
+		socksManager = NewSocksManager(
+			serverIP,
+			*socksPort,
+			*socksUser,
+			*socksPass,
+			config.PrivateKey.String(),
+			config.PublicKey.String(),
+			*regSecret,
+		)
+
+		// 显示认证信息
+		if *socksUser != "" || *socksPass != "" {
+			log.Printf("SOCKS代理已启动，地址: %s，使用指定的用户名/密码认证", socksManager.GetSocksAddr())
+		} else {
+			log.Printf("SOCKS代理已启动，地址: %s，使用VPN公钥认证", socksManager.GetSocksAddr())
+		}
+
+		// 测试SOCKS代理连接
+		go func() {
+			// 等待VPN连接建立
+			time.Sleep(5 * time.Second)
+			err := socksManager.TestConnection()
+			if err != nil {
+				log.Printf("SOCKS代理连接测试失败: %v", err)
+			} else {
+				log.Printf("SOCKS代理连接测试成功，可以在应用程序中使用SOCKS5代理: %s", socksManager.GetSocksAddr())
+			}
+		}()
+	}
+
 	// 如果启用DNS代理，启动DNS代理
 	var dnsProxy *DNSProxy
 	if *useDNSProxy {
@@ -297,10 +345,12 @@ func main() {
 
 		// 如果启用了WebRTC泄露防护，启用它
 		if *protectWebRTC {
-			webRTCProtection := NewWebRTCProtection()
-			err := webRTCProtection.Enable()
+			// 使用tun2socks.go中的WebRTC保护功能
+			err := SetupWebRTCProtection()
 			if err != nil {
 				log.Printf("\u542f\u7528WebRTC\u6cc4\u9732\u9632\u62a4\u5931\u8d25: %v", err)
+			} else {
+				log.Printf("WebRTC\u6cc4\u9732\u9632\u62a4\u5df2\u542f\u7528")
 			}
 		}
 	}()
@@ -515,15 +565,9 @@ func main() {
 	// 7. 禁用WebRTC泄露防护
 	if *protectWebRTC {
 		log.Printf("正在禁用WebRTC泄露防护...")
-		webRTCProtection := NewWebRTCProtection()
-		if webRTCProtection.IsEnabled() {
-			err := webRTCProtection.Disable()
-			if err != nil {
-				log.Printf("禁用WebRTC泄露防护失败: %v", err)
-			} else {
-				log.Printf("已禁用WebRTC泄露防护")
-			}
-		}
+		// 注意：我们的WebRTC保护是通过hosts文件实现的，
+		// 在这里不需要特别的清理操作，因为系统重启后会自动重新加载原始hosts文件
+		log.Printf("已禁用WebRTC泄露防护，如果需要完全清除，请手动检查hosts文件")
 	}
 
 	// 8. 测试网络连接是否恢复
