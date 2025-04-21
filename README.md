@@ -154,6 +154,9 @@ pekserver.exe -port 23456 -enable-reg
 - `-socks-port <端口>`: 指定 SOCKS5 代理服务器端口，默认为 1080
 - `-socks-user <用户名>`: 指定 SOCKS5 代理服务器用户名，留空则不启用认证
 - `-socks-pass <密码>`: 指定 SOCKS5 代理服务器密码，留空则不启用认证
+- `-enable-stun`: 是否启用 STUN 服务器，默认为 true
+- `-stun-port <端口>`: 指定 STUN 服务器端口，默认为 3478
+- `-public-ip <IP地址>`: 指定服务器公网 IP，留空则自动探测
 
 ### 客户端
 
@@ -190,6 +193,8 @@ pekclient.exe -server <服务器地址:端口>
 - `-socks-user <用户名>`: 指定 SOCKS5 代理用户名，留空则不启用认证
 - `-socks-pass <密码>`: 指定 SOCKS5 代理密码，留空则不启用认证
 - `-protect-webrtc`: 启用 WebRTC 泄露防护，防止真实 IP 地址泄露
+- `-webrtc-mode <模式>`: 指定 WebRTC 保护模式，可选值为 block(阻止)或 spoof(模拟)，默认为 block
+- `-stun-server <地址>`: 指定 STUN 服务器地址，用于模拟模式，默认使用 VPN 服务器
 - `-dns-proxy`: 启用 DNS 代理，防止 DNS 泄露
 - `-amnezia`: 启用 AmneziaWG 特殊修改
 
@@ -421,23 +426,41 @@ SOCKS5 代理功能特别适用于 Windows 10 系统，可以解决以下问题�
 
 ### 场景四：启用 WebRTC 泄露防护
 
+#### 阻止模式（默认）
+
 ```bash
 # 使用 Go 直接运行
 cd client
-sudo go run main.go -server <服务器IP>:23456 -protect-webrtc=true
+sudo go run main.go -server <服务器IP>:23456 -protect-webrtc=true -webrtc-mode=block
 
 # 或者使用编译后的可执行文件
-sudo ./pekclient -server <服务器IP>:23456 -protect-webrtc=true
+sudo ./pekclient -server <服务器IP>:23456 -protect-webrtc=true -webrtc-mode=block
 # Windows
-pekclient.exe -server <服务器IP>:23456 -protect-webrtc=true
+pekclient.exe -server <服务器IP>:23456 -protect-webrtc=true -webrtc-mode=block
 ```
+
+#### 模拟模式（显示VPN服务器IP）
+
+```bash
+# 服务端需要启用STUN服务器
+pekserver.exe -enable-stun=true -stun-port=3478 -public-ip=<服务器公网IP>
+
+# 客户端使用模拟模式
+pekclient.exe -server <服务器IP>:23456 -protect-webrtc=true -webrtc-mode=spoof
+```
+
+注意：模拟模式需要服务端启用STUN服务器，否则将自动回退到阻止模式。模拟模式会使 WebRTC 检测到的IP地址与VPN服务器的IP地址一致，而不是完全阻止WebRTC。
 
 WebRTC 泄露防护功能包括：
 
-1. **防火墙规则防护**：自动添加防火墙规则，阻止 STUN/TURN 请求
-2. **浏览器配置建议**：提供浏览器配置指南，帮助用户完全禁用 WebRTC
-3. **STUN 服务器阻止**：在 hosts 文件中添加常见 STUN 服务器条目，阻止连接
-4. **自动清理**：在 VPN 关闭时自动清理 hosts 文件中的 WebRTC 防护设置，确保关闭 VPN 后网络行为恢复正常
+1. **阻止模式**：完全阻止 WebRTC 获取公网IP地址
+   - 在 hosts 文件中将常见 STUN 服务器指向 127.0.0.1，阻止连接
+
+2. **模拟模式**：模拟 WebRTC 获取到的IP地址为 VPN 服务器的IP地址
+   - 在 hosts 文件中将常见 STUN 服务器指向 VPN 服务器IP
+   - 服务端运行 STUN 服务器，始终返回服务器的公网IP
+
+3. **自动清理**：在 VPN 关闭时自动清理 hosts 文件中的 WebRTC 防护设置，确保关闭 VPN 后网络行为恢复正常
 
 **注意：** 如果关闭 VPN 后 WebRTC 仍然无法显示公共 IP 地址，请尝试重启浏览器或者手动检查 hosts 文件。
 
@@ -479,6 +502,7 @@ pekserver.exe -client-timeout=30 -auto-cleanup=true
 - [x] SOCKS5 代理服务器支持
 - [x] Windows 10 路由问题解决方案
 - [x] SOCKS5 代理与 VPN 公钥认证集成
+- [x] WebRTC 模拟模式，显示 VPN 服务器 IP
 
 ### 计划中功能
 

@@ -40,6 +40,8 @@ var (
 	socksUser      = flag.String("socks-user", "", "SOCKS5代理用户名")
 	socksPass      = flag.String("socks-pass", "", "SOCKS5代理密码")
 	protectWebRTC  = flag.Bool("protect-webrtc", true, "是否防止WebRTC泄漏")
+	webRTCMode     = flag.String("webrtc-mode", "block", "WebRTC保护模式: block(阻止) 或 spoof(模拟)")
+	stunServer     = flag.String("stun-server", "", "STUN服务器地址，用于模拟WebRTC模式，默认使用VPN服务器")
 	useDNSProxy    = flag.Bool("dns-proxy", false, "是否使用DNS代理")
 	mtuValue       = flag.Int("mtu", 0, "MTU值，0表示自动探测")
 	diagnoseMode   = flag.Bool("diagnose", false, "是否启用诊断模式，用于判断无法联网的原因")
@@ -364,12 +366,15 @@ func main() {
 
 		// 如果启用了WebRTC泄露防护，启用它
 		if *protectWebRTC {
+			// 将服务器端点保存到环境变量，供模拟模式使用
+			os.Setenv("VPN_SERVER_ENDPOINT", config.Endpoint)
+
 			// 使用tun2socks.go中的WebRTC保护功能
-			err := SetupWebRTCProtection()
+			err := SetupWebRTCProtection(*webRTCMode, *stunServer)
 			if err != nil {
 				log.Printf("\u542f\u7528WebRTC\u6cc4\u9732\u9632\u62a4\u5931\u8d25: %v", err)
 			} else {
-				log.Printf("WebRTC\u6cc4\u9732\u9632\u62a4\u5df2\u542f\u7528")
+				log.Printf("WebRTC\u6cc4\u9732\u9632\u62a4\u5df2\u542f\u7528\uff0c\u6a21\u5f0f: %s", *webRTCMode)
 			}
 		}
 	}()
@@ -599,6 +604,9 @@ func main() {
 		} else {
 			log.Printf("已成功清理WebRTC保护设置")
 		}
+
+		// 清除环境变量
+		os.Unsetenv("VPN_SERVER_ENDPOINT")
 	}
 
 	// 8. 测试网络连接是否恢复

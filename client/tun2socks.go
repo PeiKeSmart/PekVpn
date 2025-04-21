@@ -256,10 +256,10 @@ func GetServerIPFromEndpoint(endpoint string) string {
 }
 
 // SetupWebRTCProtection 设置WebRTC保护
-func SetupWebRTCProtection() error {
-	log.Printf("设置WebRTC保护...")
+func SetupWebRTCProtection(mode string, customStunServer string) error {
+	log.Printf("设置WebRTC保护，模式: %s...", mode)
 
-	// 阻止常见STUN服务器
+	// 常见STUN服务器列表
 	stunServers := []string{
 		"stun.l.google.com",
 		"stun1.l.google.com",
@@ -278,8 +278,48 @@ func SetupWebRTCProtection() error {
 
 	// 构建hosts文件条目
 	var hostsEntries strings.Builder
-	for _, server := range stunServers {
-		hostsEntries.WriteString("127.0.0.1 " + server + "\n")
+
+	// 根据模式选择不同的处理方式
+	if mode == "block" {
+		// 阻止模式: 将STUN服务器指向127.0.0.1
+		log.Printf("使用阻止模式，将STUN服务器指向127.0.0.1")
+		for _, server := range stunServers {
+			hostsEntries.WriteString("127.0.0.1 " + server + "\n")
+		}
+	} else if mode == "spoof" {
+		// 模拟模式: 将STUN服务器指向VPN服务器或自定义STUN服务器
+		// 确定要使用的STUN服务器地址
+		stunServerIP := customStunServer
+		if stunServerIP == "" {
+			// 如果没有指定自定义STUN服务器，使用VPN服务器地址
+			// 从环境变量中获取服务器地址
+			serverEndpoint := os.Getenv("VPN_SERVER_ENDPOINT")
+			if serverEndpoint != "" {
+				// 从端点提取服务器IP
+				stunServerIP = GetServerIPFromEndpoint(serverEndpoint)
+			}
+
+			// 如果仍然无法获取服务器IP，使用默认端口
+			if stunServerIP == "" {
+				log.Printf("无法获取VPN服务器IP，将使用阻止模式")
+				// 回退到阻止模式
+				for _, server := range stunServers {
+					hostsEntries.WriteString("127.0.0.1 " + server + "\n")
+				}
+			} else {
+				log.Printf("使用模拟模式，将STUN服务器指向VPN服务器: %s", stunServerIP)
+				for _, server := range stunServers {
+					hostsEntries.WriteString(stunServerIP + " " + server + "\n")
+				}
+			}
+		} else {
+			log.Printf("使用模拟模式，将STUN服务器指向自定义服务器: %s", stunServerIP)
+			for _, server := range stunServers {
+				hostsEntries.WriteString(stunServerIP + " " + server + "\n")
+			}
+		}
+	} else {
+		return fmt.Errorf("无效的WebRTC保护模式: %s", mode)
 	}
 
 	// 添加条目到hosts文件
@@ -288,9 +328,10 @@ func SetupWebRTCProtection() error {
 	if err != nil {
 		log.Printf("修改hosts文件失败: %v", err)
 		log.Printf("请手动修改hosts文件，添加以下条目:\n%s", hostsEntries.String())
+		return err
 	}
 
-	log.Printf("WebRTC保护已设置")
+	log.Printf("WebRTC保护已设置，模式: %s", mode)
 	return nil
 }
 

@@ -34,6 +34,9 @@ var (
 	socksPort     = flag.Int("socks-port", 1080, "SOCKS5代理服务器端口")
 	socksUser     = flag.String("socks-user", "", "SOCKS5代理服务器用户名，留空则不启用认证")
 	socksPass     = flag.String("socks-pass", "", "SOCKS5代理服务器密码，留空则不启用认证")
+	enableStun    = flag.Bool("enable-stun", true, "是否启用STUN服务器")
+	stunPort      = flag.Int("stun-port", 3478, "STUN服务器端口")
+	publicIP      = flag.String("public-ip", "", "服务器公网IP，留空则自动探测")
 
 	// 客户端管理
 	clients     = make(map[wgtypes.Key]*wireguard.PeerInfo)
@@ -188,6 +191,28 @@ func main() {
 		} else {
 			log.Printf("SOCKS5代理服务器已启动在 %s", socksServer.GetBindAddr())
 			defer socksServer.Stop()
+		}
+	}
+
+	// 启动STUN服务器
+	if *enableStun {
+		// 获取服务器公网IP
+		serverIP, err := GetServerIP(*publicIP)
+		if err != nil {
+			log.Printf("获取服务器公网IP失败: %v", err)
+			log.Printf("将使用TUN设备IP作为STUN服务器的公网IP")
+			// 使用TUN设备IP作为备选
+			ip := strings.Split(*tunIP, "/")[0]
+			serverIP = ip
+		}
+
+		// 启动STUN服务器
+		stunServer, err := StartSTUNServer(serverIP, *stunPort)
+		if err != nil {
+			log.Printf("启动STUN服务器失败: %v", err)
+		} else {
+			log.Printf("STUN服务器已启动，监听端口: %d, 公网IP: %s", *stunPort, serverIP)
+			defer stunServer.Stop()
 		}
 	}
 
