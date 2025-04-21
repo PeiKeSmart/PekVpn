@@ -582,9 +582,21 @@ func enableIPForwarding() error {
 			}
 		}
 
-		// 4. 重启路由服务
-		cmd = "Restart-Service RemoteAccess -Force -ErrorAction SilentlyContinue"
-		_, _ = runCommand(cmd)
+		// 4. 检查RemoteAccess服务是否存在，如果存在则重启
+		cmd = "Get-Service RemoteAccess -ErrorAction SilentlyContinue"
+		output, err = runCommand(cmd)
+		if err == nil && output != "" && !strings.Contains(output, "Cannot find any service") {
+			log.Printf("RemoteAccess服务存在，尝试重启...")
+			cmd = "Restart-Service RemoteAccess -Force -ErrorAction SilentlyContinue"
+			_, err = runCommand(cmd)
+			if err != nil {
+				log.Printf("重启RemoteAccess服务失败，但这不影响VPN功能")
+			} else {
+				log.Printf("已重启RemoteAccess服务")
+			}
+		} else {
+			log.Printf("RemoteAccess服务不存在，跳过重启步骤")
+		}
 
 		// 5. 验证IP转发状态
 		cmd = "Get-NetIPInterface | Where-Object {$_.Forwarding -eq 'Enabled'} | Select-Object ifIndex, InterfaceAlias | Format-Table"
@@ -848,9 +860,21 @@ func addSpecificClient(serverConfig *wireguard.Config, wgDevice *wireguard.WireG
 		return
 	}
 
-	// 创建允许的IP
-	_, allowedIP, _ := net.ParseCIDR("0.0.0.0/0")
-	allowedIPs := []net.IPNet{*allowedIP}
+	// 创建允许的IP - 允许客户端使用任何源IP地址
+	allowedIPs := []net.IPNet{}
+
+	// 分配IP地址
+	clientIP := allocateIP()
+
+	// 允许任何IPv4地址
+	_, ipv4Net, _ := net.ParseCIDR("0.0.0.0/0")
+	allowedIPs = append(allowedIPs, *ipv4Net)
+
+	// 允许任何IPv6地址
+	_, ipv6Net, _ := net.ParseCIDR("::/0")
+	allowedIPs = append(allowedIPs, *ipv6Net)
+
+	log.Printf("为客户端设置的AllowedIPs: %v", allowedIPs)
 
 	// 创建客户端配置
 	clientConfig := &wireguard.Config{
@@ -858,8 +882,7 @@ func addSpecificClient(serverConfig *wireguard.Config, wgDevice *wireguard.WireG
 		AllowedIPs: allowedIPs,
 	}
 
-	// 分配IP地址
-	clientIP := allocateIP()
+	// 已经在上面分配了IP地址，这里不需要再分配
 
 	// 添加客户端到WireGuard设备
 	err = wgDevice.AddPeer(clientConfig, clientIP)
@@ -928,10 +951,15 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 
 			// 获取客户端IP地址
 			ipStr := ""
-			if len(peer.AllowedIPs) > 0 {
-				ipStr = peer.AllowedIPs[0].IP.String()
-			} else if peer.IP != nil {
+			// 优先使用peer.IP，因为这是分配给客户端的实际IP地址
+			if peer.IP != nil {
 				ipStr = peer.IP.String()
+			} else if len(peer.AllowedIPs) > 0 && peer.AllowedIPs[0].IP.String() != "0.0.0.0" {
+				// 只有当AllowedIPs不是0.0.0.0/0时才使用
+				ipStr = peer.AllowedIPs[0].IP.String()
+			} else {
+				// 如果上述方法都失败，使用默认的VPN客户端IP范围
+				ipStr = "10.8.0.x"
 			}
 
 			// 检查是否是新连接的客户端
@@ -960,6 +988,20 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 			if peer.LastDataReceived.After(lastActiveTime) {
 				lastActiveTime = peer.LastDataReceived
 			}
+
+			// 检查是否有握手活动
+			// WireGuard的握手周期是2分钟，所以如果在最近5分钟内有握手，就认为客户端是活跃的
+			recentHandshakeTime := time.Since(peer.LastHandshakeTime) < 5*time.Minute
+			if recentHandshakeTime {
+				// 如果有最近的握手活动，更新最后活跃时间为当前时间
+				log.Printf("客户端有最近的握手活动: %s, IP: %s, 最后握手时间: %s",
+					peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"))
+				knownPeers[peerKey] = time.Now()
+				// 清除超时警告标记
+				delete(timeoutWarnings, peerKey)
+				continue
+			}
+
 			inactiveTime := time.Since(lastActiveTime)
 
 			// 如果超过警告时间（超时时间的50%），发出警告
@@ -974,10 +1016,19 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 			if inactiveTime > timeoutDuration && *autoCleanup {
 				// 添加额外检查：尝试ping客户端
 				clientAlive := false
+				// 使用与日志显示相同的方式获取客户端IP
+				pingIP := ""
 				if peer.IP != nil {
-					cmd := fmt.Sprintf("ping -c 1 -W 2 %s", peer.IP.String())
+					pingIP = peer.IP.String()
+				} else if len(peer.AllowedIPs) > 0 && peer.AllowedIPs[0].IP.String() != "0.0.0.0" {
+					pingIP = peer.AllowedIPs[0].IP.String()
+				}
+
+				// 只有当有有效的IP地址时才尝试ping
+				if pingIP != "" && pingIP != "0.0.0.0" && pingIP != "10.8.0.x" {
+					cmd := fmt.Sprintf("ping -c 1 -W 2 %s", pingIP)
 					if runtime.GOOS == "windows" {
-						cmd = fmt.Sprintf("ping -n 1 -w 2000 %s", peer.IP.String())
+						cmd = fmt.Sprintf("ping -n 1 -w 2000 %s", pingIP)
 					}
 
 					_, err := runCommand(cmd)
@@ -1219,16 +1270,16 @@ func handleClientRegistration(conn *net.UDPConn, clientAddr *net.UDPAddr, data [
 		// 分配IP地址
 		clientIP := allocateIP()
 
-		// 创建允许的IP - 这里允许客户端接收更多流量
+		// 创建允许的IP - 允许客户端使用任何源IP地址
 		allowedIPs := []net.IPNet{}
 
-		// 添加客户端特定IP
-		_, ipNet, _ := net.ParseCIDR(fmt.Sprintf("%s/32", clientIP.String()))
-		allowedIPs = append(allowedIPs, *ipNet)
+		// 允许任何IPv4地址
+		_, ipv4Net, _ := net.ParseCIDR("0.0.0.0/0")
+		allowedIPs = append(allowedIPs, *ipv4Net)
 
-		// 添加VPN网段，允许与其他客户端通信
-		_, vpnNet, _ := net.ParseCIDR("10.8.0.0/24")
-		allowedIPs = append(allowedIPs, *vpnNet)
+		// 允许任何IPv6地址
+		_, ipv6Net, _ := net.ParseCIDR("::/0")
+		allowedIPs = append(allowedIPs, *ipv6Net)
 
 		log.Printf("为客户端设置的AllowedIPs: %v", allowedIPs)
 
