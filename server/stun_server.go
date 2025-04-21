@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"time"
@@ -10,12 +11,12 @@ import (
 
 // STUNServer 实现一个简单的STUN服务器
 type STUNServer struct {
-	conn      *net.UDPConn
-	publicIP  net.IP
-	port      int
-	running   bool
-	stopChan  chan struct{}
-	logger    *log.Logger
+	conn     *net.UDPConn
+	publicIP net.IP
+	port     int
+	running  bool
+	stopChan chan struct{}
+	logger   *log.Logger
 }
 
 // NewSTUNServer 创建一个新的STUN服务器
@@ -23,18 +24,18 @@ func NewSTUNServer(publicIP string, port int) (*STUNServer, error) {
 	// 解析公共IP
 	ip := net.ParseIP(publicIP)
 	if ip == nil {
-		return nil, stun.ErrNoIPv4Address
+		return nil, fmt.Errorf("无效的IPv4地址: %s", publicIP)
 	}
 
 	// 创建日志记录器
 	logger := log.New(log.Writer(), "[STUN] ", log.LstdFlags)
 
 	return &STUNServer{
-		publicIP:  ip,
-		port:      port,
-		running:   false,
-		stopChan:  make(chan struct{}),
-		logger:    logger,
+		publicIP: ip,
+		port:     port,
+		running:  false,
+		stopChan: make(chan struct{}),
+		logger:   logger,
 	}, nil
 }
 
