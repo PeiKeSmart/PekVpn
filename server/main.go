@@ -950,11 +950,21 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 			}
 
 			// 检查客户端活跃状态
+			// 1. 检查LastHandshakeTime
 			if peer.LastHandshakeTime.After(knownPeers[peerKey]) {
 				// 客户端有新的握手，更新时间
-				log.Printf("客户端活跃: %s, IP: %s, 最后握手时间: %s",
+				log.Printf("客户端活跃(握手): %s, IP: %s, 最后握手时间: %s",
 					peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"))
 				knownPeers[peerKey] = peer.LastHandshakeTime
+				// 清除超时警告标记
+				delete(timeoutWarnings, peerKey)
+			}
+			// 2. 检查LastDataReceived
+			if peer.LastDataReceived.After(knownPeers[peerKey]) {
+				// 客户端有新的数据接收，更新时间
+				log.Printf("客户端活跃(数据): %s, IP: %s, 最后数据接收时间: %s",
+					peerKey, ipStr, peer.LastDataReceived.Format("2006-01-02 15:04:05"))
+				knownPeers[peerKey] = peer.LastDataReceived
 				// 清除超时警告标记
 				delete(timeoutWarnings, peerKey)
 			}
@@ -980,18 +990,39 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 				// 添加额外检查：尝试ping客户端
 				clientAlive := false
 				if peer.IP != nil {
+					// 先检查是否有DEBUG日志中的握手数据
+					// 如果有，则认为客户端仍然活跃
+					// 执行ping命令，触发握手机制
 					cmd := fmt.Sprintf("ping -c 1 -W 2 %s", peer.IP.String())
 					if runtime.GOOS == "windows" {
 						cmd = fmt.Sprintf("ping -n 1 -w 2000 %s", peer.IP.String())
 					}
 
+					// 执行ping命令
 					_, err := runCommand(cmd)
 					clientAlive = (err == nil)
+
+					// 即使ping失败，也检查是否有握手数据
+					// 等待一下，给WireGuard时间处理握手
+					time.Sleep(500 * time.Millisecond)
+
+					// 再次获取对等点信息，检查是否有新的握手数据
+					updatedPeers, _ := wgDevice.GetPeers()
+					for _, updatedPeer := range updatedPeers {
+						if updatedPeer.PublicKey.String() == peerKey {
+							// 如果最后握手时间比我们之前检查的时间更新，则认为客户端活跃
+							if updatedPeer.LastHandshakeTime.After(lastActiveTime) {
+								log.Printf("检测到客户端有新的握手数据: %s, IP: %s", peerKey, ipStr)
+								clientAlive = true
+							}
+							break
+						}
+					}
 				}
 
-				// 如果ping成功，更新最后活跃时间并跳过清理
+				// 如果ping成功或有新的握手数据，更新最后活跃时间并跳过清理
 				if clientAlive {
-					log.Printf("客户端仍然活跃(ping成功): %s, IP: %s", peerKey, ipStr)
+					log.Printf("客户端仍然活跃: %s, IP: %s", peerKey, ipStr)
 					knownPeers[peerKey] = time.Now()
 					delete(timeoutWarnings, peerKey)
 					continue
@@ -1337,6 +1368,31 @@ func NewSimpleLogFilter(originalWriter io.Writer) *SimpleLogFilter {
 func (f *SimpleLogFilter) Write(p []byte) (n int, err error) {
 	// 将字节转换为字符串
 	logMessage := string(p)
+
+	// 如果包含握手相关的日志，始终输出
+	if strings.Contains(logMessage, "handshake") {
+		// 提取peer ID
+		peerID := ""
+		start := strings.Index(logMessage, "peer(")
+		if start != -1 {
+			end := strings.Index(logMessage[start:], ")")
+			if end != -1 {
+				peerID = logMessage[start+5 : start+end]
+			}
+		}
+
+		// 如果是握手相关的日志，添加更多信息
+		if strings.Contains(logMessage, "Received handshake") {
+			return f.originalWriter.Write([]byte(fmt.Sprintf("收到客户端 %s 的握手请求\n", peerID)))
+		} else if strings.Contains(logMessage, "Sending handshake") {
+			return f.originalWriter.Write([]byte(fmt.Sprintf("发送握手响应给客户端 %s\n", peerID)))
+		} else if strings.Contains(logMessage, "keepalive") {
+			return f.originalWriter.Write([]byte(fmt.Sprintf("收到客户端 %s 的保活包\n", peerID)))
+		}
+
+		// 其他握手相关的日志正常输出
+		return f.originalWriter.Write(p)
+	}
 
 	// 如果包含我们要过滤的错误信息
 	if strings.Contains(logMessage, "IPv4 packet with disallowed source address from peer") {
