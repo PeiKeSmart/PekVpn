@@ -39,6 +39,7 @@ var (
 	mtuValue       = flag.Int("mtu", 0, "MTU值，0表示自动探测")
 	protectWebRTC  = flag.Bool("protect-webrtc", false, "是否启用WebRTC泄露防护")
 	diagnoseMode   = flag.Bool("diagnose", false, "是否启用诊断模式，用于判断无法联网的原因")
+	fixNetwork     = flag.Bool("fix-network", false, "修复网络问题")
 
 	// 系统信息
 	hostname, _ = os.Hostname()
@@ -70,6 +71,17 @@ func main() {
 
 		// 清理可能冲突的网络资源
 		cleanupNetworkResources()
+	}
+
+	// 如果指定了修复网络选项
+	if *fixNetwork {
+		log.Printf("正在执行网络修复...")
+		if fixNetworkNow() {
+			log.Printf("网络修复成功，程序将退出")
+		} else {
+			log.Printf("网络修复失败，请尝试重启计算机")
+		}
+		return
 	}
 
 	log.Printf("启动WireGuard VPN客户端...")
@@ -1514,6 +1526,71 @@ func cleanupNetworkResources() {
 	time.Sleep(1 * time.Second)
 }
 
+// cleanupBeforeExit 在退出前彻底清理网络配置
+func cleanupBeforeExit(config *wireguard.Config) {
+	log.Printf("正在彻底清理网络配置...")
+
+	// 1. 清理所有路由
+	if *fullTunnel {
+		// 删除默认路由
+		log.Printf("删除默认路由...")
+		_, defaultNet, _ := net.ParseCIDR("0.0.0.0/0")
+		deleteRoute(defaultNet.String())
+	}
+
+	// 删除VPN网段路由
+	log.Printf("删除VPN网段路由...")
+	_, vpnNet, _ := net.ParseCIDR("10.8.0.0/24")
+	deleteRoute(vpnNet.String())
+	_, vpnNet2, _ := net.ParseCIDR("10.9.0.0/24")
+	deleteRoute(vpnNet2.String())
+
+	// 删除服务器特殊路由
+	if config != nil && config.Endpoint != "" {
+		host, _, err := net.SplitHostPort(config.Endpoint)
+		if err == nil {
+			serverIP := net.ParseIP(host)
+			if serverIP != nil {
+				log.Printf("删除服务器特殊路由: %s", serverIP.String())
+				cmd := fmt.Sprintf("route delete %s", serverIP.String())
+				_, _ = runCommand(cmd)
+			}
+		}
+	}
+
+	// 2. 重置DNS配置
+	log.Printf("重置DNS配置...")
+	resetDNSSettings()
+
+	// 3. 刷新DNS缓存
+	log.Printf("刷新DNS缓存...")
+	flushDNSCache()
+
+	// 4. 清理网络资源
+	log.Printf("清理网络资源...")
+	cleanupNetworkResources()
+
+	// 5. 等待清理完成
+	time.Sleep(2 * time.Second)
+
+	// 6. 验证网络连接
+	if !checkNetworkConnectivity() {
+		log.Printf("网络连接异常，尝试恢复...")
+		resetNetworkStack()
+
+		// 再次验证
+		if checkNetworkConnectivity() {
+			log.Printf("网络连接已恢复")
+		} else {
+			log.Printf("网络连接仍然异常，可能需要重启计算机")
+		}
+	} else {
+		log.Printf("网络连接正常")
+	}
+
+	log.Printf("网络配置清理完成")
+}
+
 // cleanupOrphanedAdapters 清理孤立的WireGuard适配器
 func cleanupOrphanedAdapters() {
 	// 查找客户端的WireGuard适配器，避免清理服务端的适配器
@@ -1980,6 +2057,120 @@ func flushDNSCache() {
 	}
 }
 
+// resetDNSSettings 重置DNS设置
+func resetDNSSettings() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	log.Printf("正在重置DNS设置...")
+
+	// 获取所有活跃的网络适配器
+	cmd := "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object -ExpandProperty ifIndex"
+	output, _ := runCommand(cmd)
+	indices := strings.Split(strings.TrimSpace(output), "\n")
+
+	// 重置所有适配器的DNS设置
+	for _, index := range indices {
+		index = strings.TrimSpace(index)
+		if index != "" {
+			// 重置DNS为自动获取
+			cmd = fmt.Sprintf("Set-DnsClientServerAddress -InterfaceIndex %s -ResetServerAddresses", index)
+			_, _ = runCommand(cmd)
+		}
+	}
+
+	// 刷新DNS缓存
+	flushDNSCache()
+
+	log.Printf("已重置DNS设置")
+}
+
+// restartDNSClient 重启DNS客户端服务
+func restartDNSClient() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	log.Printf("正在重启DNS客户端服务...")
+
+	// 重启DNS客户端服务
+	cmd := "Restart-Service -Name Dnscache -Force -ErrorAction SilentlyContinue"
+	_, err := runCommand(cmd)
+	if err != nil {
+		log.Printf("重启DNS客户端服务失败: %v", err)
+	} else {
+		log.Printf("已重启DNS客户端服务")
+	}
+
+	// 等待服务重启
+	time.Sleep(2 * time.Second)
+}
+
+// restartPhysicalAdapters 重启物理网络适配器
+func restartPhysicalAdapters() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	log.Printf("正在重启物理网络适配器...")
+
+	// 获取物理网络适配器
+	cmd := "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*' -and $_.InterfaceDescription -notlike '*TAP-Windows*'} | Select-Object -ExpandProperty Name"
+	output, _ := runCommand(cmd)
+	adapters := strings.Split(strings.TrimSpace(output), "\n")
+
+	// 重新启用物理网络适配器
+	for _, adapter := range adapters {
+		adapter = strings.TrimSpace(adapter)
+		if adapter != "" {
+			restartSingleAdapter(adapter)
+		}
+	}
+
+	// 等待适配器重启
+	time.Sleep(5 * time.Second)
+
+	log.Printf("物理网络适配器重启完成")
+}
+
+// checkNetworkConnectivity 检查网络连接是否正常
+func checkNetworkConnectivity() bool {
+	// 尝试解析多个域名，只要有一个成功就认为网络正常
+	testDomains := []string{"baidu.com", "qq.com", "microsoft.com"}
+
+	for _, domain := range testDomains {
+		cmd := fmt.Sprintf("nslookup %s", domain)
+		_, err := runCommand(cmd)
+		if err == nil {
+			log.Printf("网络连接正常，可以解析 %s", domain)
+			return true
+		}
+	}
+
+	// 尝试ping公共DNS服务器
+	cmd := "ping -n 1 -w 2000 8.8.8.8"
+	_, err := runCommand(cmd)
+	if err == nil {
+		log.Printf("网络连接正常，可以ping通8.8.8.8")
+		return true
+	}
+
+	// 尝试ping默认网关
+	defaultGateway, err := getDefaultGateway()
+	if err == nil {
+		cmd = fmt.Sprintf("ping -n 1 -w 2000 %s", defaultGateway)
+		_, err = runCommand(cmd)
+		if err == nil {
+			log.Printf("网络连接正常，可以ping通默认网关 %s", defaultGateway)
+			return true
+		}
+	}
+
+	log.Printf("网络连接异常，无法解析域名或ping通DNS服务器")
+	return false
+}
+
 // diagnoseBaiduConnection 诊断百度网站连接问题 - 已禁用
 func diagnoseBaiduConnection() {
 	log.Printf("百度网站连接诊断功能已禁用")
@@ -1998,6 +2189,114 @@ func warmupBaiduConnection() {
 // monitorAndOptimizeBaiduConnection 监控和优化百度连接 - 已禁用
 func monitorAndOptimizeBaiduConnection(wgDevice *wireguard.WireGuardDevice) {
 	log.Printf("百度连接监控和自动优化功能已禁用")
+}
+
+// diagnoseAndFixNetwork 诊断和修复网络问题
+func diagnoseAndFixNetwork() bool {
+	log.Printf("正在诊断网络问题...")
+
+	// 1. 检查网络连接
+	if checkNetworkConnectivity() {
+		log.Printf("网络连接正常")
+		return true
+	}
+
+	// 2. 检查路由表
+	log.Printf("检查路由表...")
+	cmd := "route print"
+	output, _ := runCommand(cmd)
+	log.Printf("当前路由表(摘要):\n%s", truncateOutput(output, 20))
+
+	// 3. 检查DNS配置
+	log.Printf("检查DNS配置...")
+	cmd = "Get-DnsClientServerAddress -AddressFamily IPv4 | Format-List"
+	output, _ = runCommand(cmd)
+	log.Printf("当前DNS配置(摘要):\n%s", truncateOutput(output, 10))
+
+	// 4. 尝试修复路由表
+	log.Printf("尝试修复路由表...")
+	// 删除可能冲突的路由
+	_, defaultNet, _ := net.ParseCIDR("0.0.0.0/0")
+	deleteRoute(defaultNet.String())
+
+	// 5. 重置DNS
+	log.Printf("重置DNS配置...")
+	resetDNSSettings()
+	flushDNSCache()
+
+	// 6. 检查是否修复成功
+	if checkNetworkConnectivity() {
+		log.Printf("网络问题已修复")
+		return true
+	}
+
+	// 7. 如果仍然失败，尝试重置网络栈
+	log.Printf("尝试重置网络栈...")
+	if resetNetworkStack() {
+		log.Printf("网络栈重置成功")
+		return true
+	}
+
+	log.Printf("网络问题无法自动修复，请尝试重启计算机")
+	return false
+}
+
+// fixNetworkNow 立即修复网络问题
+func fixNetworkNow() bool {
+	log.Printf("正在立即修复网络问题...")
+
+	// 1. 强制刷新DNS缓存
+	flushDNSCache()
+
+	// 2. 重置DNS配置
+	resetDNSSettings()
+
+	// 3. 清理所有路由
+	cleanupAllRoutes()
+
+	// 4. 重置Winsock
+	cmd := "netsh winsock reset"
+	_, _ = runCommand(cmd)
+
+	// 5. 重置TCP/IP协议栈
+	cmd = "netsh int ip reset"
+	_, _ = runCommand(cmd)
+
+	// 6. 重启DNS客户端服务
+	restartDNSClient()
+
+	// 7. 重启物理网络适配器
+	restartPhysicalAdapters()
+
+	// 8. 检查是否修复成功
+	if checkNetworkConnectivity() {
+		log.Printf("网络问题已修复")
+		return true
+	}
+
+	log.Printf("网络问题无法立即修复，建议重启计算机")
+	return false
+}
+
+// cleanupAllRoutes 清理所有路由
+func cleanupAllRoutes() {
+	log.Printf("清理所有路由...")
+
+	// 删除所有可能的VPN相关路由
+	deleteRoute("0.0.0.0/0")
+	deleteRoute("10.8.0.0/24")
+	deleteRoute("10.9.0.0/24")
+
+	// 获取默认网关
+	defaultGateway, err := getDefaultGateway()
+	if err == nil {
+		// 添加默认路由，确保基本网络连接
+		cmd := fmt.Sprintf("route add 0.0.0.0 mask 0.0.0.0 %s metric 1", defaultGateway)
+		_, _ = runCommand(cmd)
+		log.Printf("已添加默认路由到 %s", defaultGateway)
+	}
+
+	log.Printf("路由清理完成")
 }
 
 // testInternetConnection 测试互联网连接
