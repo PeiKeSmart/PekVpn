@@ -788,16 +788,6 @@ func registerClientWithServer(serverEndpoint string, clientPublicKey wgtypes.Key
 		return "", fmt.Errorf("解析注册服务地址失败: %v", err)
 	}
 
-	// 尝试连接
-	regConn, err := net.DialUDP("udp", nil, regAddr)
-	if err != nil {
-		return "", fmt.Errorf("无法连接到注册服务: %v", err)
-	}
-	defer regConn.Close()
-
-	// 设置超时
-	regConn.SetDeadline(time.Now().Add(5 * time.Second))
-
 	// 创建注册请求
 	request := RegistrationRequest{
 		Command:    "REGISTER_CLIENT",
@@ -812,32 +802,66 @@ func registerClientWithServer(serverEndpoint string, clientPublicKey wgtypes.Key
 		return "", fmt.Errorf("序列化请求失败: %v", err)
 	}
 
-	// 发送注册请求
-	_, err = regConn.Write(requestJSON)
-	if err != nil {
-		return "", fmt.Errorf("发送注册请求失败: %v", err)
+	// 添加重试机制
+	maxRetries := 3
+	retryDelay := 5 * time.Second
+
+	var lastErr error
+	for retry := 0; retry < maxRetries; retry++ {
+		if retry > 0 {
+			log.Printf("注册失败，第 %d 次重试...", retry)
+			time.Sleep(retryDelay)
+		}
+
+		// 尝试连接
+		regConn, err := net.DialUDP("udp", nil, regAddr)
+		if err != nil {
+			lastErr = fmt.Errorf("无法连接到注册服务: %v", err)
+			continue
+		}
+
+		// 设置更长的超时时间
+		timeout := 15 * time.Second
+		regConn.SetDeadline(time.Now().Add(timeout))
+		log.Printf("已设置注册超时时间为%d秒", int(timeout.Seconds()))
+
+		// 发送注册请求
+		_, err = regConn.Write(requestJSON)
+		if err != nil {
+			regConn.Close()
+			lastErr = fmt.Errorf("发送注册请求失败: %v", err)
+			continue
+		}
+
+		// 接收响应
+		buf := make([]byte, 1024)
+		n, _, err := regConn.ReadFromUDP(buf)
+		regConn.Close() // 关闭连接
+
+		if err != nil {
+			lastErr = fmt.Errorf("接收响应失败: %v", err)
+			continue
+		}
+
+		// 解析响应
+		var response RegistrationResponse
+		if err := json.Unmarshal(buf[:n], &response); err != nil {
+			lastErr = fmt.Errorf("解析响应失败: %v", err)
+			continue
+		}
+
+		// 检查响应
+		if !response.Success {
+			lastErr = fmt.Errorf("注册失败: %s", response.Message)
+			continue
+		}
+
+		log.Printf("注册成功: %s", response.Message)
+		return response.IP, nil
 	}
 
-	// 接收响应
-	buf := make([]byte, 1024)
-	n, _, err := regConn.ReadFromUDP(buf)
-	if err != nil {
-		return "", fmt.Errorf("接收响应失败: %v", err)
-	}
-
-	// 解析响应
-	var response RegistrationResponse
-	if err := json.Unmarshal(buf[:n], &response); err != nil {
-		return "", fmt.Errorf("解析响应失败: %v", err)
-	}
-
-	// 检查响应
-	if !response.Success {
-		return "", fmt.Errorf("注册失败: %s", response.Message)
-	}
-
-	log.Printf("注册成功: %s", response.Message)
-	return response.IP, nil
+	// 所有重试都失败
+	return "", fmt.Errorf("注册失败，已重试%d次: %v", maxRetries, lastErr)
 }
 
 // generateNewConfig 生成新的WireGuard配置

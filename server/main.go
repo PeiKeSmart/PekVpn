@@ -1217,8 +1217,17 @@ func handleClientRegistration(conn *net.UDPConn, clientAddr *net.UDPAddr, data [
 		// 返回服务器公钥
 		publicKey := wireguard.GeneratePublicKey(serverConfig.PrivateKey)
 		log.Printf("收到来自 %s 的公钥请求", clientAddr.String())
-		conn.WriteToUDP([]byte(publicKey.String()), clientAddr)
-		log.Printf("已向客户端 %s 发送服务器公钥: %s", clientAddr.String(), publicKey.String())
+		// 尝试多次发送公钥，提高可靠性
+		for i := 0; i < 3; i++ {
+			_, err := conn.WriteToUDP([]byte(publicKey.String()), clientAddr)
+			if err != nil {
+				log.Printf("发送公钥失败，重试 %d/3: %v", i+1, err)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			log.Printf("已向客户端 %s 发送服务器公钥: %s", clientAddr.String(), publicKey.String())
+			break
+		}
 		return
 	}
 
@@ -1340,8 +1349,16 @@ func sendRegistrationResponse(conn *net.UDPConn, clientAddr *net.UDPAddr, succes
 		return
 	}
 
-	if _, err := conn.WriteToUDP(responseJSON, clientAddr); err != nil {
-		log.Printf("发送响应失败: %v", err)
+	// 尝试多次发送响应，提高可靠性
+	for i := 0; i < 3; i++ {
+		_, err := conn.WriteToUDP(responseJSON, clientAddr)
+		if err != nil {
+			log.Printf("发送响应失败，重试 %d/3: %v", i+1, err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		log.Printf("已成功发送响应到客户端 %s", clientAddr.String())
+		break
 	}
 }
 
