@@ -29,7 +29,7 @@ var (
 	clientPubKey  = flag.String("client-pubkey", "", "客户端公钥")
 	regEnabled    = flag.Bool("enable-reg", true, "是否启用客户端自动注册")
 	regSecret     = flag.String("reg-secret", "vpnsecret", "客户端注册密钥")
-	clientTimeout = flag.Int("client-timeout", 10, "客户端超时时间(分钟)，超过此时间未响应的客户端将被自动清理")
+	clientTimeout = flag.Int("client-timeout", 5, "客户端超时时间(分钟)，超过此时间未响应的客户端将被自动清理")
 	autoCleanup   = flag.Bool("auto-cleanup", true, "是否自动清理超时的客户端")
 
 	// 客户端管理
@@ -950,20 +950,32 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 			}
 
 			// 检查客户端活跃状态
-			if peer.LastHandshakeTime.After(knownPeers[peerKey]) {
-				// 客户端有新的握手，更新时间
-				log.Printf("客户端活跃: %s, IP: %s, 最后握手时间: %s",
-					peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"))
-				knownPeers[peerKey] = peer.LastHandshakeTime
-				// 清除超时警告标记
-				delete(timeoutWarnings, peerKey)
+			// 改进的握手检测逻辑，避免错误判断客户端不活跃
+			if peer.LastHandshakeTime.After(time.Time{}) { // 只要有握手记录就认为客户端活跃
+				// 如果最后握手时间比已知时间更新，或者距离现在不超过3分钟
+				if peer.LastHandshakeTime.After(knownPeers[peerKey]) || time.Since(peer.LastHandshakeTime) < 3*time.Minute {
+					// 如果是新的握手，记录日志
+					if peer.LastHandshakeTime.After(knownPeers[peerKey]) {
+						log.Printf("客户端有新的握手: %s, IP: %s, 最后握手时间: %s",
+							peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"))
+					}
+
+					// 更新客户端活跃时间
+					knownPeers[peerKey] = time.Now() // 使用当前时间而不是握手时间
+					// 清除超时警告标记
+					delete(timeoutWarnings, peerKey)
+				}
 			}
 
 			// 检查客户端是否长时间未活跃
-			// 使用最后数据接收时间和最后握手时间的最大值来判断
+			// 使用最后数据接收时间、最后握手时间和已知活跃时间的最大值来判断
 			lastActiveTime := peer.LastHandshakeTime
 			if peer.LastDataReceived.After(lastActiveTime) {
 				lastActiveTime = peer.LastDataReceived
+			}
+			// 使用已知的活跃时间作为参考
+			if knownPeers[peerKey].After(lastActiveTime) {
+				lastActiveTime = knownPeers[peerKey]
 			}
 			inactiveTime := time.Since(lastActiveTime)
 
@@ -980,18 +992,33 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 				// 添加额外检查：尝试ping客户端
 				clientAlive := false
 				if peer.IP != nil {
-					cmd := fmt.Sprintf("ping -c 1 -W 2 %s", peer.IP.String())
-					if runtime.GOOS == "windows" {
-						cmd = fmt.Sprintf("ping -n 1 -w 2000 %s", peer.IP.String())
-					}
+					// 尝试多次ping，提高可靠性
+					for i := 0; i < 3; i++ {
+						cmd := fmt.Sprintf("ping -c 1 -W 2 %s", peer.IP.String())
+						if runtime.GOOS == "windows" {
+							cmd = fmt.Sprintf("ping -n 1 -w 2000 %s", peer.IP.String())
+						}
 
-					_, err := runCommand(cmd)
-					clientAlive = (err == nil)
+						_, err := runCommand(cmd)
+						if err == nil {
+							clientAlive = true
+							break
+						}
+						// 等待一下再尝试
+						time.Sleep(500 * time.Millisecond)
+					}
 				}
 
-				// 如果ping成功，更新最后活跃时间并跳过清理
+				// 检查最近的握手时间，如果在最近3分钟内有握手，也认为客户端活跃
+				if time.Since(peer.LastHandshakeTime) < 3*time.Minute {
+					clientAlive = true
+					log.Printf("客户端最近有握手活动: %s, IP: %s, 最后握手时间: %s",
+						peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"))
+				}
+
+				// 如果ping成功或最近有握手，更新最后活跃时间并跳过清理
 				if clientAlive {
-					log.Printf("客户端仍然活跃(ping成功): %s, IP: %s", peerKey, ipStr)
+					log.Printf("客户端仍然活跃: %s, IP: %s", peerKey, ipStr)
 					knownPeers[peerKey] = time.Now()
 					delete(timeoutWarnings, peerKey)
 					continue
