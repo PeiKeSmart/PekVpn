@@ -36,6 +36,10 @@ var (
 	clients     = make(map[wgtypes.Key]*wireguard.PeerInfo)
 	clientsLock sync.Mutex
 
+	// 全局握手时间记录，用于跟踪客户端握手活动
+	handshakeTimes = make(map[string]time.Time) // 客户端公钥 -> 最后握手时间
+	handshakeLock  sync.Mutex                   // 握手时间锁
+
 	// IP地址分配
 	nextIP = net.ParseIP("10.8.0.2").To4()
 	ipLock sync.Mutex
@@ -999,6 +1003,19 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 			if knownPeers[peerKey].After(lastActiveTime) {
 				lastActiveTime = knownPeers[peerKey]
 			}
+
+			// 检查全局心跳时间记录
+			handshakeLock.Lock()
+			heartbeatTime, exists := handshakeTimes[peerKey]
+			handshakeLock.Unlock()
+
+			if exists {
+				log.Printf("客户端心跳时间记录: %s, 时间: %s", peerKey, heartbeatTime.Format("2006-01-02 15:04:05"))
+				if heartbeatTime.After(lastActiveTime) {
+					lastActiveTime = heartbeatTime
+					log.Printf("使用心跳时间作为最后活跃时间: %s", lastActiveTime.Format("2006-01-02 15:04:05"))
+				}
+			}
 			inactiveTime := time.Since(lastActiveTime)
 
 			// 如果超过警告时间（超时时间的50%），发出警告
@@ -1302,6 +1319,11 @@ func handleClientRegistration(conn *net.UDPConn, clientAddr *net.UDPAddr, data [
 			log.Printf("已更新客户端活跃时间: %s, IP: %s", request.PublicKey, clientAddr.String())
 		}
 		clientsLock.Unlock()
+
+		// 更新全局握手时间记录
+		handshakeLock.Lock()
+		handshakeTimes[request.PublicKey] = time.Now()
+		handshakeLock.Unlock()
 
 		// 返回成功响应
 		sendRegistrationResponse(conn, clientAddr, true, "心跳成功", "")
