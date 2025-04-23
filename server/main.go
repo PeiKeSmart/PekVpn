@@ -1284,6 +1284,58 @@ func handleClientRegistration(conn *net.UDPConn, clientAddr *net.UDPAddr, data [
 		return
 	}
 
+	// 处理心跳命令
+	if request.Command == "HEARTBEAT" {
+		log.Printf("收到来自 %s 的心跳请求", clientAddr.String())
+		// 解析客户端公钥
+		clientPublicKey, err := wireguard.ParseKey(request.PublicKey)
+		if err != nil {
+			log.Printf("解析客户端公钥失败: %v", err)
+			sendRegistrationResponse(conn, clientAddr, false, "无效的公钥格式", "")
+			return
+		}
+
+		// 更新客户端活跃时间
+		clientsLock.Lock()
+		if _, exists := clients[clientPublicKey]; exists {
+			// 更新客户端活跃时间
+			log.Printf("已更新客户端活跃时间: %s, IP: %s", request.PublicKey, clientAddr.String())
+		}
+		clientsLock.Unlock()
+
+		// 返回成功响应
+		sendRegistrationResponse(conn, clientAddr, true, "心跳成功", "")
+		return
+	}
+
+	// 处理断开连接通知
+	if request.Command == "DISCONNECT" {
+		log.Printf("收到来自 %s 的断开连接通知", clientAddr.String())
+		// 解析客户端公钥
+		clientPublicKey, err := wireguard.ParseKey(request.PublicKey)
+		if err != nil {
+			log.Printf("解析客户端公钥失败: %v", err)
+			sendRegistrationResponse(conn, clientAddr, false, "无效的公钥格式", "")
+			return
+		}
+
+		// 移除客户端
+		if err := wgDevice.RemovePeer(clientPublicKey); err != nil {
+			log.Printf("移除客户端失败: %v", err)
+			sendRegistrationResponse(conn, clientAddr, false, "移除客户端失败", "")
+			return
+		}
+
+		log.Printf("已移除客户端: %s", request.PublicKey)
+
+		// 更新配置文件
+		updateConfigFile(wgDevice)
+
+		// 返回成功响应
+		sendRegistrationResponse(conn, clientAddr, true, "客户端断开连接成功", "")
+		return
+	}
+
 	// 处理注册命令
 	if request.Command == "REGISTER_CLIENT" {
 		log.Printf("收到来自 %s 的客户端注册请求", clientAddr.String())

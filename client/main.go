@@ -317,6 +317,14 @@ func main() {
 		}
 	}()
 
+	// 创建停止通道
+	heartbeatStopCh := make(chan struct{})
+
+	// 启动心跳服务
+	clientPubKey := wireguard.GeneratePublicKey(config.PrivateKey).String()
+	go startHeartbeatService(config.Endpoint, clientPubKey, config, heartbeatStopCh)
+	log.Printf("心跳服务已启动，将定期向服务器发送心跳")
+
 	// 启动连接监控和自动重连
 	go startConnectionMonitor(wgDevice, config)
 
@@ -405,6 +413,15 @@ func main() {
 
 	<-sigCh
 	log.Printf("正在关闭WireGuard客户端...")
+
+	// 停止心跳服务
+	log.Printf("正在停止心跳服务...")
+	close(heartbeatStopCh)
+
+	// 向服务器发送断开连接通知
+	log.Printf("正在向服务器发送断开连接通知...")
+	// 使用之前已经生成的公钥
+	sendDisconnectNotification(config.Endpoint, clientPubKey)
 
 	// 清理资源
 	log.Printf("正在清理资源，恢复网络配置...")
