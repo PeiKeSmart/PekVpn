@@ -895,6 +895,8 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 	knownPeers := make(map[string]time.Time)
 	// 初始化超时警告映射，记录已经发出警告的客户端
 	timeoutWarnings := make(map[string]bool)
+	// 记录最后握手时间
+	lastHandshakeTimes := make(map[string]time.Time)
 
 	// 计算超时时间
 	timeoutDuration := time.Duration(*clientTimeout) * time.Minute
@@ -945,26 +947,46 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 				// 新客户端连接
 				log.Printf("新客户端连接: %s, IP: %s", peerKey, ipStr)
 				knownPeers[peerKey] = time.Now()
+				lastHandshakeTimes[peerKey] = peer.LastHandshakeTime
 				// 清除超时警告标记
 				delete(timeoutWarnings, peerKey)
+				continue
 			}
 
-			// 检查客户端活跃状态
-			// 改进的握手检测逻辑，避免错误判断客户端不活跃
-			if peer.LastHandshakeTime.After(time.Time{}) { // 只要有握手记录就认为客户端活跃
-				// 如果最后握手时间比已知时间更新，或者距离现在不超过3分钟
-				if peer.LastHandshakeTime.After(knownPeers[peerKey]) || time.Since(peer.LastHandshakeTime) < 3*time.Minute {
-					// 如果是新的握手，记录日志
-					if peer.LastHandshakeTime.After(knownPeers[peerKey]) {
-						log.Printf("客户端有新的握手: %s, IP: %s, 最后握手时间: %s",
-							peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"))
-					}
+			// 检查客户端活跃状态 - 增强握手检测逻辑
+			// 1. 检查是否有新的握手
+			if peer.LastHandshakeTime.After(lastHandshakeTimes[peerKey]) {
+				log.Printf("检测到新的握手活动: %s, IP: %s, 上次握手: %s, 当前握手: %s",
+					peerKey, ipStr,
+					lastHandshakeTimes[peerKey].Format("2006-01-02 15:04:05"),
+					peer.LastHandshakeTime.Format("2006-01-02 15:04:05"))
 
-					// 更新客户端活跃时间
-					knownPeers[peerKey] = time.Now() // 使用当前时间而不是握手时间
+				// 更新最后握手时间记录
+				lastHandshakeTimes[peerKey] = peer.LastHandshakeTime
+
+				// 更新客户端活跃时间
+				knownPeers[peerKey] = time.Now()
+
+				// 清除超时警告标记
+				delete(timeoutWarnings, peerKey)
+				continue
+			}
+
+			// 2. 即使没有新握手，如果最近有握手活动（3分钟内），也认为客户端活跃
+			if !peer.LastHandshakeTime.IsZero() && time.Since(peer.LastHandshakeTime) < 3*time.Minute {
+				// 不需要每次都记录日志，避免日志过多
+				// 只有当客户端之前被标记为警告时才记录
+				if timeoutWarnings[peerKey] {
+					log.Printf("客户端最近有握手活动，重置活跃状态: %s, IP: %s, 最后握手时间: %s",
+						peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"))
+
 					// 清除超时警告标记
 					delete(timeoutWarnings, peerKey)
 				}
+
+				// 更新客户端活跃时间
+				knownPeers[peerKey] = time.Now()
+				continue
 			}
 
 			// 检查客户端是否长时间未活跃
@@ -1009,23 +1031,36 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 					}
 				}
 
-				// 检查最近的握手时间，如果在最近3分钟内有握手，也认为客户端活跃
-				if time.Since(peer.LastHandshakeTime) < 3*time.Minute {
-					clientAlive = true
-					log.Printf("客户端最近有握手活动: %s, IP: %s, 最后握手时间: %s",
-						peerKey, ipStr, peer.LastHandshakeTime.Format("2006-01-02 15:04:05"))
+				// 再次检查最近的握手时间，确保不会错过最新的握手
+				// 直接从设备获取最新状态，避免使用可能过时的peer对象
+				latestPeers, _ := wgDevice.GetPeers()
+				for _, latestPeer := range latestPeers {
+					if latestPeer.PublicKey.String() == peerKey {
+						if time.Since(latestPeer.LastHandshakeTime) < 3*time.Minute {
+							clientAlive = true
+							log.Printf("最新检查显示客户端最近有握手活动: %s, IP: %s, 最后握手时间: %s",
+								peerKey, ipStr, latestPeer.LastHandshakeTime.Format("2006-01-02 15:04:05"))
+
+							// 更新记录的握手时间
+							lastHandshakeTimes[peerKey] = latestPeer.LastHandshakeTime
+						}
+						break
+					}
 				}
 
 				// 如果ping成功或最近有握手，更新最后活跃时间并跳过清理
 				if clientAlive {
-					log.Printf("客户端仍然活跃: %s, IP: %s", peerKey, ipStr)
+					log.Printf("客户端仍然活跃，取消清理: %s, IP: %s", peerKey, ipStr)
 					knownPeers[peerKey] = time.Now()
 					delete(timeoutWarnings, peerKey)
 					continue
 				}
 
-				log.Printf("清理超时客户端: %s, IP: %s, 最后活跃时间: %s, 不活跃时间: %s",
-					peerKey, ipStr, lastActiveTime.Format("2006-01-02 15:04:05"), inactiveTime.Round(time.Second))
+				log.Printf("清理超时客户端: %s, IP: %s, 最后活跃时间: %s, 不活跃时间: %s, 最后握手时间: %s",
+					peerKey, ipStr,
+					lastActiveTime.Format("2006-01-02 15:04:05"),
+					inactiveTime.Round(time.Second),
+					peer.LastHandshakeTime.Format("2006-01-02 15:04:05"))
 
 				// 解析公钥
 				pubKey, err := wireguard.ParseKey(peerKey)
@@ -1044,6 +1079,8 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 					delete(knownPeers, peerKey)
 					// 清除超时警告标记
 					delete(timeoutWarnings, peerKey)
+					// 清除握手时间记录
+					delete(lastHandshakeTimes, peerKey)
 					// 从当前客户端列表中移除
 					delete(currentPeers, peerKey)
 
@@ -1059,6 +1096,7 @@ func monitorClientConnections(wgDevice *wireguard.WireGuardDevice) {
 				// 客户端断开连接
 				log.Printf("客户端断开连接: %s", peerKey)
 				delete(knownPeers, peerKey)
+				delete(lastHandshakeTimes, peerKey)
 				// 清除超时警告标记
 				delete(timeoutWarnings, peerKey)
 			}
@@ -1362,18 +1400,21 @@ func sendRegistrationResponse(conn *net.UDPConn, clientAddr *net.UDPAddr, succes
 	}
 }
 
+// 添加日志过滤器，过滤常见的WireGuard错误消息，如"IPv4 packet with disallowed source address"和"invalid initiation message"
 // 添加日志过滤器，过滤“IPv4 packet with disallowed source address”错误
 type SimpleLogFilter struct {
-	originalWriter io.Writer
-	errorCount     map[string]int
-	mutex          sync.Mutex
+	originalWriter   io.Writer
+	errorCount       map[string]int // 记录"IPv4 packet with disallowed source address"错误次数
+	invalidInitCount map[string]int // 记录"invalid initiation message"错误次数
+	mutex            sync.Mutex
 }
 
 // 创建新的日志过滤器
 func NewSimpleLogFilter(originalWriter io.Writer) *SimpleLogFilter {
 	return &SimpleLogFilter{
-		originalWriter: originalWriter,
-		errorCount:     make(map[string]int),
+		originalWriter:   originalWriter,
+		errorCount:       make(map[string]int),
+		invalidInitCount: make(map[string]int),
 	}
 }
 
@@ -1408,6 +1449,30 @@ func (f *SimpleLogFilter) Write(p []byte) (n int, err error) {
 			} else {
 				return f.originalWriter.Write([]byte("收到不允许的源地址数据包，这是正常现象，将在下次握手后解决\n"))
 			}
+		}
+
+		// 其他情况下完全忽略
+		return len(p), nil
+	}
+
+	// 过滤"invalid initiation message"错误
+	if strings.Contains(logMessage, "Received invalid initiation message from") {
+		// 提取IP地址
+		ipAddr := ""
+		parts := strings.Split(logMessage, "from ")
+		if len(parts) > 1 {
+			ipAddr = strings.TrimSpace(parts[1])
+		}
+
+		// 记录错误次数
+		f.mutex.Lock()
+		f.invalidInitCount[ipAddr]++
+		count := f.invalidInitCount[ipAddr]
+		f.mutex.Unlock()
+
+		// 每10次错误只记录一次
+		if count%10 == 1 {
+			return f.originalWriter.Write([]byte(fmt.Sprintf("收到来自 %s 的无效握手请求，这可能是客户端配置错误或重连尝试\n", ipAddr)))
 		}
 
 		// 其他情况下完全忽略
