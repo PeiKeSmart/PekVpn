@@ -281,15 +281,36 @@ func main() {
 
 			// 如果启用了DNS代理，将DNS服务器设置为127.0.0.1
 			if runtime.GOOS == "windows" {
-				// 获取TUN接口索引
-				cmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.Name -eq '%s' -or $_.InterfaceDescription -like '*WireGuard*'} | Select-Object -ExpandProperty ifIndex", wgDevice.TunName)
+				// 获取所有匹配的网络适配器信息
+				cmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.Name -eq '%s' -or $_.InterfaceDescription -like '*WireGuard*'} | Format-List Name, InterfaceDescription, Status, ifIndex", wgDevice.TunName)
 				output, _ := runCommand(cmd)
+
+				// 记录所有匹配的适配器信息，便于调试
+				log.Printf("DNS代理: 找到以下匹配的网络适配器:\n%s", output)
+
+				// 使用更精确的查询，只选择状态为Up的WireGuard适配器
+				cmd = fmt.Sprintf("Get-NetAdapter | Where-Object {($_.Name -eq '%s' -or $_.InterfaceDescription -like '*WireGuard*') -and $_.Status -eq 'Up'} | Select-Object -First 1 -ExpandProperty ifIndex", wgDevice.TunName)
+				output, _ = runCommand(cmd)
+
+				// 如果没有找到状态为Up的适配器，尝试任何匹配的适配器
+				if strings.TrimSpace(output) == "" {
+					log.Printf("DNS代理: 没有找到状态为Up的WireGuard适配器，尝试任何匹配的适配器")
+					cmd = fmt.Sprintf("Get-NetAdapter | Where-Object {$_.Name -eq '%s' -or $_.InterfaceDescription -like '*WireGuard*'} | Select-Object -First 1 -ExpandProperty ifIndex", wgDevice.TunName)
+					output, _ = runCommand(cmd)
+				}
+
+				// 解析接口索引
 				ifIndex := strings.TrimSpace(output)
 				if ifIndex != "" {
+					// 记录选择的接口索引值
+					log.Printf("DNS代理: 选择的网络接口索引: %s", ifIndex)
+
 					// 配置DNS服务器为本地DNS代理
 					cmd = fmt.Sprintf("Set-DnsClientServerAddress -InterfaceIndex %s -ServerAddresses '127.0.0.1'", ifIndex)
 					_, _ = runCommand(cmd)
 					log.Printf("已将DNS服务器设置为本地DNS代理")
+				} else {
+					log.Printf("DNS代理: 无法找到WireGuard网络接口，DNS设置失败")
 				}
 			}
 		}
@@ -1122,18 +1143,39 @@ func configureTunIP(tunName string, ip net.IP, ipNet *net.IPNet) error {
 		// 在Windows上，有时需要等待设备准备就绪
 		time.Sleep(2 * time.Second)
 
-		// 获取接口索引
-		cmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceDescription -like '*TAP-Windows*' -or $_.InterfaceAlias -eq '%s'} | Select-Object -ExpandProperty ifIndex", tunName)
+		// 获取所有匹配的网络适配器信息
+		cmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceDescription -like '*TAP-Windows*' -or $_.InterfaceAlias -eq '%s'} | Format-List Name, InterfaceDescription, Status, ifIndex", tunName)
 		output, err := runCommand(cmd)
 		if err != nil {
 			return fmt.Errorf("获取网络接口失败: %v", err)
 		}
 
-		// 解析接口索引
+		// 记录所有匹配的适配器信息，便于调试
+		log.Printf("找到以下匹配的网络适配器:\n%s", output)
+
+		// 使用更精确的查询，只选择状态为Up的WireGuard适配器
+		// 如果没有状态为Up的，则选择任何WireGuard适配器
+		cmd = fmt.Sprintf("Get-NetAdapter | Where-Object {($_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceAlias -eq '%s') -and $_.Status -eq 'Up'} | Select-Object -First 1 -ExpandProperty ifIndex", tunName)
+		output, err = runCommand(cmd)
+
+		// 如果没有找到状态为Up的适配器，尝试任何匹配的适配器
+		if err != nil || strings.TrimSpace(output) == "" {
+			log.Printf("没有找到状态为Up的WireGuard适配器，尝试任何匹配的适配器")
+			cmd = fmt.Sprintf("Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceDescription -like '*TAP-Windows*' -or $_.InterfaceAlias -eq '%s'} | Select-Object -First 1 -ExpandProperty ifIndex", tunName)
+			output, err = runCommand(cmd)
+			if err != nil || strings.TrimSpace(output) == "" {
+				return fmt.Errorf("无法找到WireGuard网络接口")
+			}
+		}
+
+		// 解析接口索引 - 确保没有换行符和其他不可见字符
 		ifIndex := strings.TrimSpace(output)
 		if ifIndex == "" {
 			return fmt.Errorf("无法找到WireGuard网络接口")
 		}
+
+		// 记录选择的接口索引值
+		log.Printf("选择的网络接口索引: %s", ifIndex)
 
 		// 先检查是否有冲突的IP地址 - 使用cmd.exe执行ipconfig命令
 		checkCmd := "cmd.exe /c \"ipconfig /all\""
@@ -1148,8 +1190,10 @@ func configureTunIP(tunName string, ip net.IP, ipNet *net.IPNet) error {
 		}
 
 		// 配置IP地址 - 使用单行命令避免换行问题
-		cmd = fmt.Sprintf("New-NetIPAddress -InterfaceIndex %s -IPAddress %s -PrefixLength %d -Confirm:$false", ifIndex, ip.String(), maskBits(ipNet.Mask))
-		_, err = runCommand(cmd)
+		// 使用变量存储命令，确保不会被错误地分行
+		// 使用$()包裹命令，确保PowerShell将其作为一个整体执行
+		cmdStr := fmt.Sprintf("$(New-NetIPAddress -InterfaceIndex %s -IPAddress %s -PrefixLength %d -Confirm:$false)", ifIndex, ip.String(), maskBits(ipNet.Mask))
+		_, err = runCommand(cmdStr)
 		if err != nil {
 			// 如果失败，可能是因为IP已经存在，尝试移除并重新添加
 			removeCmd := fmt.Sprintf("Remove-NetIPAddress -InterfaceIndex %s -Confirm:$false -ErrorAction SilentlyContinue", ifIndex)
@@ -1159,8 +1203,9 @@ func configureTunIP(tunName string, ip net.IP, ipNet *net.IPNet) error {
 			time.Sleep(1 * time.Second)
 
 			// 尝试使用netsh命令配置IP地址
-			netshCmd := fmt.Sprintf("cmd.exe /c \"netsh interface ip add address \\\"%s\\\" %s %s\"", tunName, ip.String(), net.IP(ipNet.Mask).String())
-			_, err = runCommand(netshCmd)
+			// 使用变量存储命令，确保不会被错误地分行
+			netshCmdStr := fmt.Sprintf("cmd.exe /c \"netsh interface ip add address \\\"%s\\\" %s %s\"", tunName, ip.String(), net.IP(ipNet.Mask).String())
+			_, err = runCommand(netshCmdStr)
 			if err != nil {
 				return fmt.Errorf("配置IP地址失败: %v", err)
 			}
@@ -1192,7 +1237,9 @@ func runCommand(cmd string) (string, error) {
 	}
 
 	if runtime.GOOS == "windows" {
-		command = exec.Command("powershell", "-Command", cmd)
+		// 使用-NoProfile和-NonInteractive选项确保PowerShell不会添加额外的输出
+		// 使用-Command参数传递命令，确保命令作为一个整体执行
+		command = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", cmd)
 	} else {
 		command = exec.Command("sh", "-c", cmd)
 	}
@@ -1686,6 +1733,18 @@ func getDefaultGateway() (string, error) {
 	}
 }
 
+// cleanupInterfaceIndex 清理接口索引，只保留数字
+func cleanupInterfaceIndex(index string) string {
+	// 创建一个只包含数字的新字符串
+	var result strings.Builder
+	for _, char := range index {
+		if char >= '0' && char <= '9' {
+			result.WriteRune(char)
+		}
+	}
+	return result.String()
+}
+
 // getDefaultIPv6Gateway 获取默认IPv6网关
 func getDefaultIPv6Gateway() (string, error) {
 	switch runtime.GOOS {
@@ -2082,11 +2141,29 @@ func cleanupOrphanedAdapters() {
 func getTunIP(tunName string) (string, error) {
 	switch runtime.GOOS {
 	case "windows":
-		// 获取接口索引
-		cmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceDescription -like '*TAP-Windows*' -or $_.InterfaceAlias -eq '%s'} | Select-Object -ExpandProperty ifIndex", tunName)
+		// 获取所有匹配的网络适配器信息
+		cmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceDescription -like '*TAP-Windows*' -or $_.InterfaceAlias -eq '%s'} | Format-List Name, InterfaceDescription, Status, ifIndex", tunName)
 		output, err := runCommand(cmd)
 		if err != nil {
 			return "", fmt.Errorf("获取网络接口失败: %v", err)
+		}
+
+		// 记录所有匹配的适配器信息，便于调试
+		log.Printf("getTunIP: 找到以下匹配的网络适配器:\n%s", output)
+
+		// 使用更精确的查询，只选择状态为Up的WireGuard适配器
+		// 如果没有状态为Up的，则选择任何WireGuard适配器
+		cmd = fmt.Sprintf("Get-NetAdapter | Where-Object {($_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceAlias -eq '%s') -and $_.Status -eq 'Up'} | Select-Object -First 1 -ExpandProperty ifIndex", tunName)
+		output, err = runCommand(cmd)
+
+		// 如果没有找到状态为Up的适配器，尝试任何匹配的适配器
+		if err != nil || strings.TrimSpace(output) == "" {
+			log.Printf("getTunIP: 没有找到状态为Up的WireGuard适配器，尝试任何匹配的适配器")
+			cmd = fmt.Sprintf("Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -or $_.InterfaceDescription -like '*TAP-Windows*' -or $_.InterfaceAlias -eq '%s'} | Select-Object -First 1 -ExpandProperty ifIndex", tunName)
+			output, err = runCommand(cmd)
+			if err != nil || strings.TrimSpace(output) == "" {
+				return "", fmt.Errorf("无法找到WireGuard网络接口")
+			}
 		}
 
 		// 解析接口索引
@@ -2094,6 +2171,9 @@ func getTunIP(tunName string) (string, error) {
 		if ifIndex == "" {
 			return "", fmt.Errorf("无法找到WireGuard网络接口")
 		}
+
+		// 记录选择的接口索引值
+		log.Printf("getTunIP: 选择的网络接口索引: %s", ifIndex)
 
 		// 获取IP地址
 		cmd = fmt.Sprintf("Get-NetIPAddress -InterfaceIndex %s -AddressFamily IPv4 | Select-Object -ExpandProperty IPAddress", ifIndex)
@@ -2359,17 +2439,38 @@ func configureDNS(tunName string) error {
 func doConfigureDNS(tunName string) error {
 	switch runtime.GOOS {
 	case "windows":
-		// 获取TUN接口索引
-		cmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.Name -eq '%s' -or $_.InterfaceDescription -like '*WireGuard*'} | Select-Object -ExpandProperty ifIndex", tunName)
+		// 获取所有匹配的网络适配器信息
+		cmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.Name -eq '%s' -or $_.InterfaceDescription -like '*WireGuard*'} | Format-List Name, InterfaceDescription, Status, ifIndex", tunName)
 		output, err := runCommand(cmd)
 		if err != nil {
-			return fmt.Errorf("获取TUN接口索引失败: %v", err)
+			return fmt.Errorf("获取网络接口失败: %v", err)
 		}
 
+		// 记录所有匹配的适配器信息，便于调试
+		log.Printf("doConfigureDNS: 找到以下匹配的网络适配器:\n%s", output)
+
+		// 使用更精确的查询，只选择状态为Up的WireGuard适配器
+		cmd = fmt.Sprintf("Get-NetAdapter | Where-Object {($_.Name -eq '%s' -or $_.InterfaceDescription -like '*WireGuard*') -and $_.Status -eq 'Up'} | Select-Object -First 1 -ExpandProperty ifIndex", tunName)
+		output, err = runCommand(cmd)
+
+		// 如果没有找到状态为Up的适配器，尝试任何匹配的适配器
+		if err != nil || strings.TrimSpace(output) == "" {
+			log.Printf("doConfigureDNS: 没有找到状态为Up的WireGuard适配器，尝试任何匹配的适配器")
+			cmd = fmt.Sprintf("Get-NetAdapter | Where-Object {$_.Name -eq '%s' -or $_.InterfaceDescription -like '*WireGuard*'} | Select-Object -First 1 -ExpandProperty ifIndex", tunName)
+			output, err = runCommand(cmd)
+			if err != nil || strings.TrimSpace(output) == "" {
+				return fmt.Errorf("无法找到WireGuard网络接口")
+			}
+		}
+
+		// 解析接口索引
 		ifIndex := strings.TrimSpace(output)
 		if ifIndex == "" {
 			return fmt.Errorf("无法获取TUN接口索引")
 		}
+
+		// 记录选择的接口索引值
+		log.Printf("doConfigureDNS: 选择的网络接口索引: %s", ifIndex)
 
 		// 配置DNS服务器(使用Google DNS)
 		cmd = fmt.Sprintf("Set-DnsClientServerAddress -InterfaceIndex %s -ServerAddresses '8.8.8.8','8.8.4.4'", ifIndex) // Google DNS
