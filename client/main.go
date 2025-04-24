@@ -52,6 +52,9 @@ var (
 	// 反检测相关的全局变量
 	antiDetectionEnabled bool              // 是否启用反检测措施
 	defaultTransport     http.RoundTripper // 原始Transport备份
+
+	// IPv6相关的全局变量
+	serverIPv6Address string // 服务器IPv6地址，用于清理特殊路由
 )
 
 func main() {
@@ -449,8 +452,18 @@ func main() {
 		if err == nil {
 			serverIP := net.ParseIP(host)
 			if serverIP != nil && !serverIP.IsLoopback() {
-				deleteRoute(serverIP.String())
-				log.Printf("已清理服务器特殊路由: %s", serverIP.String())
+				// 检查是否是IPv6地址
+				isIPv6 := serverIP.To4() == nil
+
+				if isIPv6 {
+					// 清理IPv6服务器特殊路由
+					deleteIPv6ServerRoute(serverIP)
+					log.Printf("已清理IPv6服务器特殊路由: %s", serverIP.String())
+				} else {
+					// 清理IPv4服务器特殊路由
+					deleteRoute(serverIP.String())
+					log.Printf("已清理IPv4服务器特殊路由: %s", serverIP.String())
+				}
 			}
 		}
 
@@ -622,20 +635,41 @@ func createConfigFromKeys(serverPubKeyStr, privateKeyStr, endpoint, clientIPStr 
 	}
 
 	// 根据用户选择的代理模式设置允许的IP
-	var allowedIP *net.IPNet
-	var parseErr error
+	var allowedIPs []net.IPNet
 	if *fullTunnel {
 		// 全局代理模式
-		_, allowedIP, parseErr = net.ParseCIDR("0.0.0.0/0")
-		log.Printf("使用全局代理模式，所有流量将通过VPN")
+		// 添加IPv4全局路由
+		_, allowedIPv4, parseErr := net.ParseCIDR("0.0.0.0/0")
+		if parseErr != nil {
+			return nil, fmt.Errorf("解析IPv4允许的IP失败: %v", parseErr)
+		}
+		allowedIPs = append(allowedIPs, *allowedIPv4)
+
+		// 添加IPv6全局路由
+		_, allowedIPv6, parseErr := net.ParseCIDR("::/0")
+		if parseErr != nil {
+			return nil, fmt.Errorf("解析IPv6允许的IP失败: %v", parseErr)
+		}
+		allowedIPs = append(allowedIPs, *allowedIPv6)
+		log.Printf("调试: 添加IPv6全局路由 ::/0 到AllowedIPs")
+
+		log.Printf("使用全局代理模式，所有IPv4和IPv6流量将通过VPN")
 	} else {
 		// 分流模式，只允许VPN网段的流量
-		_, allowedIP, parseErr = net.ParseCIDR("10.9.0.0/24")
-		log.Printf("使用分流模式，只允许VPN网段的流量")
-	}
+		_, allowedIPv4, parseErr := net.ParseCIDR("10.9.0.0/24")
+		if parseErr != nil {
+			return nil, fmt.Errorf("解析IPv4允许的IP失败: %v", parseErr)
+		}
+		allowedIPs = append(allowedIPs, *allowedIPv4)
 
-	if parseErr != nil {
-		return nil, fmt.Errorf("解析允许的IP失败: %v", parseErr)
+		// 添加IPv6 VPN网段
+		_, allowedIPv6, parseErr := net.ParseCIDR("fd86:ea04:1115::/64")
+		if parseErr != nil {
+			return nil, fmt.Errorf("解析IPv6允许的IP失败: %v", parseErr)
+		}
+		allowedIPs = append(allowedIPs, *allowedIPv6)
+
+		log.Printf("使用分流模式，只允许VPN网段的IPv4和IPv6流量")
 	}
 
 	// 创建配置
@@ -643,8 +677,18 @@ func createConfigFromKeys(serverPubKeyStr, privateKeyStr, endpoint, clientIPStr 
 		PrivateKey:          privateKey,
 		PublicKey:           serverPubKey,
 		Endpoint:            endpoint,
-		AllowedIPs:          []net.IPNet{*allowedIP},
+		AllowedIPs:          allowedIPs,
 		PersistentKeepalive: 25, // 每25秒发送一次keepalive包
+	}
+
+	// 输出调试信息
+	log.Printf("调试: WireGuard配置信息:")
+	log.Printf("调试: - 端点: %s", endpoint)
+	log.Printf("调试: - 客户端公钥: %s", wireguard.GeneratePublicKey(privateKey).String())
+	log.Printf("调试: - 服务端公钥: %s", serverPubKey.String())
+	log.Printf("调试: - 允许的IP列表:")
+	for i, ip := range allowedIPs {
+		log.Printf("调试:   %d. %s", i+1, ip.String())
 	}
 
 	return config, nil
@@ -782,6 +826,7 @@ type RegistrationResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
 	IP      string `json:"ip,omitempty"`
+	IPv6    string `json:"ipv6,omitempty"` // 添加IPv6地址字段
 }
 
 // registerClientWithServer 向服务器注册客户端
@@ -874,6 +919,14 @@ func registerClientWithServer(serverEndpoint string, clientPublicKey wgtypes.Key
 		}
 
 		log.Printf("注册成功: %s", response.Message)
+
+		// 记录服务器分配的IPv6地址
+		if response.IPv6 != "" {
+			log.Printf("服务器分配的IPv6地址: %s", response.IPv6)
+			// 将IPv6地址保存到全局变量，便于后续使用
+			serverIPv6Address = response.IPv6
+		}
+
 		return response.IP, nil
 	}
 
@@ -890,20 +943,40 @@ func generateNewConfig(endpoint, clientIPStr string) (*wireguard.Config, error) 
 	}
 
 	// 根据用户选择的代理模式设置允许的IP
-	var allowedIP *net.IPNet
-	var parseErr error
+	var allowedIPs []net.IPNet
 	if *fullTunnel {
 		// 全局代理模式
-		_, allowedIP, parseErr = net.ParseCIDR("0.0.0.0/0")
-		log.Printf("使用全局代理模式，所有流量将通过VPN")
+		// 添加IPv4全局路由
+		_, allowedIPv4, parseErr := net.ParseCIDR("0.0.0.0/0")
+		if parseErr != nil {
+			return nil, fmt.Errorf("解析IPv4允许的IP失败: %v", parseErr)
+		}
+		allowedIPs = append(allowedIPs, *allowedIPv4)
+
+		// 添加IPv6全局路由
+		_, allowedIPv6, parseErr := net.ParseCIDR("::/0")
+		if parseErr != nil {
+			return nil, fmt.Errorf("解析IPv6允许的IP失败: %v", parseErr)
+		}
+		allowedIPs = append(allowedIPs, *allowedIPv6)
+
+		log.Printf("使用全局代理模式，所有IPv4和IPv6流量将通过VPN")
 	} else {
 		// 分流模式，只允许VPN网段的流量
-		_, allowedIP, parseErr = net.ParseCIDR("10.9.0.0/24")
-		log.Printf("使用分流模式，只允许VPN网段的流量")
-	}
+		_, allowedIPv4, parseErr := net.ParseCIDR("10.9.0.0/24")
+		if parseErr != nil {
+			return nil, fmt.Errorf("解析IPv4允许的IP失败: %v", parseErr)
+		}
+		allowedIPs = append(allowedIPs, *allowedIPv4)
 
-	if parseErr != nil {
-		return nil, fmt.Errorf("解析允许的IP失败: %v", parseErr)
+		// 添加IPv6 VPN网段
+		_, allowedIPv6, parseErr := net.ParseCIDR("fd86:ea04:1115::/64")
+		if parseErr != nil {
+			return nil, fmt.Errorf("解析IPv6允许的IP失败: %v", parseErr)
+		}
+		allowedIPs = append(allowedIPs, *allowedIPv6)
+
+		log.Printf("使用分流模式，只允许VPN网段的IPv4和IPv6流量")
 	}
 
 	// 尝试从服务器获取公钥
@@ -942,7 +1015,7 @@ func generateNewConfig(endpoint, clientIPStr string) (*wireguard.Config, error) 
 		PrivateKey:          privateKey,
 		PublicKey:           serverPublicKey, // 设置服务器公钥
 		Endpoint:            endpoint,
-		AllowedIPs:          []net.IPNet{*allowedIP},
+		AllowedIPs:          allowedIPs,
 		PersistentKeepalive: 25, // 每25秒发送一次keepalive包
 	}
 
@@ -1112,6 +1185,12 @@ func maskBits(mask net.IPMask) int {
 func addRoute(network, tunName string) error {
 	log.Printf("正在添加路由: %s 通过 %s", network, tunName)
 
+	// 检查是否是IPv6路由
+	_, ipNet, err := net.ParseCIDR(network)
+	if err == nil && ipNet.IP.To4() == nil {
+		log.Printf("调试: 添加IPv6路由: %s", network)
+	}
+
 	// 最多重试3次
 	for i := 0; i < 3; i++ {
 		err := doAddRoute(network, tunName)
@@ -1131,6 +1210,9 @@ func addRoute(network, tunName string) error {
 
 // doAddRoute 实际添加路由的函数
 func doAddRoute(network, tunName string) error {
+	// 记录路由添加详细信息
+	log.Printf("调试: 开始添加路由 %s 通过 %s", network, tunName)
+
 	// 根据操作系统添加路由
 	switch runtime.GOOS {
 	case "linux":
@@ -1154,6 +1236,58 @@ func doAddRoute(network, tunName string) error {
 		_, ipNet, err := net.ParseCIDR(network)
 		if err != nil {
 			return fmt.Errorf("解析网络失败: %v", err)
+		}
+
+		// 检查是否是IPv6路由
+		isIPv6 := ipNet.IP.To4() == nil
+		if isIPv6 {
+			log.Printf("调试: 在Windows上添加IPv6路由: %s", network)
+
+			// 获取接口索引
+			ifIndexCmd := fmt.Sprintf("Get-NetAdapter | Where-Object {$_.InterfaceAlias -eq '%s'} | Select-Object -ExpandProperty ifIndex", tunName)
+			ifIndex, err := runCommand(ifIndexCmd)
+			ifIndex = strings.TrimSpace(ifIndex)
+			if err != nil || ifIndex == "" {
+				log.Printf("调试: 获取接口索引失败: %v", err)
+				// 尝试使用接口名称
+				ifIndex = tunName
+			}
+
+			// 先删除可能存在的路由
+			deleteCmd := fmt.Sprintf("Remove-NetRoute -DestinationPrefix %s -Confirm:$false -ErrorAction SilentlyContinue", network)
+			_, _ = runCommand(deleteCmd)
+
+			// 尝试使用PowerShell的New-NetRoute命令
+			psCmd := fmt.Sprintf("New-NetRoute -DestinationPrefix %s -InterfaceIndex %s -RouteMetric 1 -PolicyStore ActiveStore",
+				network, ifIndex)
+			output, err := runCommand(psCmd)
+			if err != nil {
+				log.Printf("调试: PowerShell添加IPv6路由失败: %v, 输出: %s", err, output)
+
+				// 尝试使用netsh命令添加IPv6路由
+				netshCmd := fmt.Sprintf("netsh interface ipv6 add route %s \"%s\" metric=1", network, tunName)
+				output, err = runCommand(netshCmd)
+				if err != nil {
+					log.Printf("调试: netsh添加IPv6路由失败: %v, 输出: %s", err, output)
+
+					// 尝试使用route命令
+					routeCmd := fmt.Sprintf("route -6 add %s interface=\"%s\" metric 1", network, tunName)
+					output, err = runCommand(routeCmd)
+					if err != nil {
+						log.Printf("调试: route命令添加IPv6路由失败: %v, 输出: %s", err, output)
+						return fmt.Errorf("添加IPv6路由失败: %v", err)
+					} else {
+						log.Printf("调试: 成功使用route命令添加IPv6路由: %s", network)
+						return nil
+					}
+				} else {
+					log.Printf("调试: 成功使用netsh添加IPv6路由: %s", network)
+					return nil
+				}
+			} else {
+				log.Printf("调试: 成功使用PowerShell添加IPv6路由: %s", network)
+				return nil
+			}
 		}
 
 		ip := ipNet.IP.String()
@@ -1442,7 +1576,7 @@ func updateMTU(tunName string, mtu int) error {
 	return nil
 }
 
-// getDefaultGateway 获取默认网关
+// getDefaultGateway 获取默认IPv4网关
 func getDefaultGateway() (string, error) {
 	switch runtime.GOOS {
 	case "windows":
@@ -1480,7 +1614,7 @@ func getDefaultGateway() (string, error) {
 			}
 		}
 
-		return "", fmt.Errorf("无法获取默认网关")
+		return "", fmt.Errorf("无法获取默认IPv4网关")
 
 	case "linux":
 		// 使用ip route命令
@@ -1493,7 +1627,7 @@ func getDefaultGateway() (string, error) {
 			}
 		}
 
-		return "", fmt.Errorf("无法获取默认网关")
+		return "", fmt.Errorf("无法获取默认IPv4网关")
 
 	case "darwin": // macOS
 		// 使用route命令
@@ -1506,10 +1640,259 @@ func getDefaultGateway() (string, error) {
 			}
 		}
 
-		return "", fmt.Errorf("无法获取默认网关")
+		return "", fmt.Errorf("无法获取默认IPv4网关")
 
 	default:
 		return "", fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
+
+// getDefaultIPv6Gateway 获取默认IPv6网关
+func getDefaultIPv6Gateway() (string, error) {
+	switch runtime.GOOS {
+	case "windows":
+		// 方法1: 使用PowerShell获取IPv6默认路由
+		cmd := "Get-NetRoute -DestinationPrefix '::/0' | Select-Object -First 1 -ExpandProperty NextHop"
+		output, err := runCommand(cmd)
+		if err == nil {
+			gateway := strings.TrimSpace(output)
+			if gateway != "" {
+				return gateway, nil
+			}
+		}
+
+		// 方法2: 使用netsh命令
+		cmd = "netsh interface ipv6 show route | findstr ::/0"
+		output, _ = runCommand(cmd)
+		lines := strings.Split(output, "\n")
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) >= 4 {
+				return fields[3], nil
+			}
+		}
+
+		// 方法3: 使用ipconfig
+		cmd = "ipconfig | findstr /i \"IPv6 Default Gateway\""
+		output, _ = runCommand(cmd)
+		lines = strings.Split(output, "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "IPv6 Default Gateway") {
+				parts := strings.Split(line, ":")
+				if len(parts) >= 2 {
+					return strings.TrimSpace(parts[1]), nil
+				}
+			}
+		}
+
+		// 如果找不到IPv6网关，尝试获取链路本地地址
+		cmd = "Get-NetIPAddress -AddressFamily IPv6 | Where-Object { $_.PrefixOrigin -eq 'RouterAdvertisement' } | Select-Object -First 1 -ExpandProperty IPAddress"
+		output, _ = runCommand(cmd)
+		if output != "" {
+			// 获取到了IPv6地址，尝试构造链路本地网关地址
+			// 通常链路本地地址以fe80::开头
+			return "fe80::1", nil
+		}
+
+		return "", fmt.Errorf("无法获取默认IPv6网关")
+
+	case "linux":
+		// 使用ip -6 route命令
+		cmd := "ip -6 route | grep default | awk '{print $3}'"
+		output, err := runCommand(cmd)
+		if err == nil {
+			gateway := strings.TrimSpace(output)
+			if gateway != "" {
+				return gateway, nil
+			}
+		}
+
+		return "", fmt.Errorf("无法获取默认IPv6网关")
+
+	case "darwin": // macOS
+		// 使用route命令
+		cmd := "route -n get -inet6 default | grep gateway | awk '{print $2}'"
+		output, err := runCommand(cmd)
+		if err == nil {
+			gateway := strings.TrimSpace(output)
+			if gateway != "" {
+				return gateway, nil
+			}
+		}
+
+		return "", fmt.Errorf("无法获取默认IPv6网关")
+
+	default:
+		return "", fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
+
+// getDefaultInterface 获取默认网络接口
+func getDefaultInterface() (string, error) {
+	switch runtime.GOOS {
+	case "windows":
+		// 获取默认IPv4路由的接口索引
+		cmd := "Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object -First 1 -ExpandProperty InterfaceIndex"
+		output, err := runCommand(cmd)
+		if err == nil {
+			ifIndex := strings.TrimSpace(output)
+			if ifIndex != "" {
+				// 获取接口名称
+				cmd = fmt.Sprintf("Get-NetAdapter | Where-Object {$_.ifIndex -eq %s} | Select-Object -ExpandProperty Name", ifIndex)
+				output, err = runCommand(cmd)
+				if err == nil {
+					ifName := strings.TrimSpace(output)
+					if ifName != "" {
+						return ifName, nil
+					}
+				}
+			}
+		}
+
+		// 尝试获取活跃的非WireGuard接口
+		cmd = "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*' -and $_.InterfaceDescription -notlike '*TAP*'} | Select-Object -First 1 -ExpandProperty Name"
+		output, _ = runCommand(cmd)
+		ifName := strings.TrimSpace(output)
+		if ifName != "" {
+			return ifName, nil
+		}
+
+		return "", fmt.Errorf("无法获取默认网络接口")
+
+	case "linux":
+		// 使用ip route命令获取默认路由的接口
+		cmd := "ip route | grep default | awk '{print $5}'"
+		output, err := runCommand(cmd)
+		if err == nil {
+			ifName := strings.TrimSpace(output)
+			if ifName != "" {
+				return ifName, nil
+			}
+		}
+
+		return "", fmt.Errorf("无法获取默认网络接口")
+
+	case "darwin": // macOS
+		// 使用route命令获取默认路由的接口
+		cmd := "route -n get default | grep interface | awk '{print $2}'"
+		output, err := runCommand(cmd)
+		if err == nil {
+			ifName := strings.TrimSpace(output)
+			if ifName != "" {
+				return ifName, nil
+			}
+		}
+
+		return "", fmt.Errorf("无法获取默认网络接口")
+
+	default:
+		return "", fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
+
+// getDefaultIPv6Interface 获取默认IPv6网络接口
+func getDefaultIPv6Interface() (string, error) {
+	switch runtime.GOOS {
+	case "windows":
+		// 获取默认IPv6路由的接口索引
+		cmd := "Get-NetRoute -DestinationPrefix '::/0' | Select-Object -First 1 -ExpandProperty InterfaceIndex"
+		output, err := runCommand(cmd)
+		if err == nil {
+			ifIndex := strings.TrimSpace(output)
+			if ifIndex != "" {
+				// 获取接口名称
+				cmd = fmt.Sprintf("Get-NetAdapter | Where-Object {$_.ifIndex -eq %s} | Select-Object -ExpandProperty Name", ifIndex)
+				output, err = runCommand(cmd)
+				if err == nil {
+					ifName := strings.TrimSpace(output)
+					if ifName != "" {
+						return ifName, nil
+					}
+				}
+			}
+		}
+
+		// 尝试获取有IPv6地址的活跃非WireGuard接口
+		cmd = "Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*WireGuard*' -and $_.InterfaceDescription -notlike '*TAP*'} | ForEach-Object { $ifName = $_.Name; Get-NetIPAddress -InterfaceAlias $ifName -AddressFamily IPv6 | Select-Object @{Name='Name';Expression={$ifName}} } | Select-Object -First 1 -ExpandProperty Name"
+		output, _ = runCommand(cmd)
+		ifName := strings.TrimSpace(output)
+		if ifName != "" {
+			return ifName, nil
+		}
+
+		// 如果找不到IPv6接口，使用默认IPv4接口
+		return getDefaultInterface()
+
+	case "linux":
+		// 使用ip -6 route命令获取默认IPv6路由的接口
+		cmd := "ip -6 route | grep default | awk '{print $5}'"
+		output, err := runCommand(cmd)
+		if err == nil {
+			ifName := strings.TrimSpace(output)
+			if ifName != "" {
+				return ifName, nil
+			}
+		}
+
+		// 如果找不到IPv6接口，使用默认IPv4接口
+		return getDefaultInterface()
+
+	case "darwin": // macOS
+		// 使用route命令获取默认IPv6路由的接口
+		cmd := "route -n get -inet6 default | grep interface | awk '{print $2}'"
+		output, err := runCommand(cmd)
+		if err == nil {
+			ifName := strings.TrimSpace(output)
+			if ifName != "" {
+				return ifName, nil
+			}
+		}
+
+		// 如果找不到IPv6接口，使用默认IPv4接口
+		return getDefaultInterface()
+
+	default:
+		return "", fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+}
+
+// deleteIPv6ServerRoute 清理IPv6服务器特殊路由
+func deleteIPv6ServerRoute(serverIP net.IP) {
+	// 根据操作系统清理IPv6特殊路由
+	switch runtime.GOOS {
+	case "windows":
+		// 尝试使用netsh命令删除IPv6路由
+		deleteCmd := fmt.Sprintf("netsh interface ipv6 delete route %s/128 interface=all", serverIP.String())
+		output, err := runCommand(deleteCmd)
+		if err != nil {
+			log.Printf("清理IPv6服务器特殊路由失败: %v, 输出: %s", err, output)
+
+			// 尝试使用替代方法
+			deleteCmd = fmt.Sprintf("route -6 delete %s/128", serverIP.String())
+			output, err = runCommand(deleteCmd)
+			if err != nil {
+				log.Printf("使用替代方法清理IPv6服务器特殊路由失败: %v, 输出: %s", err, output)
+			}
+		}
+
+	case "linux":
+		// 删除IPv6特殊路由
+		deleteCmd := fmt.Sprintf("ip -6 route del %s/128", serverIP.String())
+		output, err := runCommand(deleteCmd)
+		if err != nil {
+			log.Printf("清理IPv6服务器特殊路由失败: %v, 输出: %s", err, output)
+		}
+
+	case "darwin": // macOS
+		// 删除IPv6特殊路由
+		deleteCmd := fmt.Sprintf("route -n delete -inet6 %s/128", serverIP.String())
+		output, err := runCommand(deleteCmd)
+		if err != nil {
+			log.Printf("清理IPv6服务器特殊路由失败: %v, 输出: %s", err, output)
+		}
+
+	default:
+		log.Printf("不支持的操作系统: %s", runtime.GOOS)
 	}
 }
 
@@ -3293,36 +3676,124 @@ func addServerRoute(endpoint string) {
 		return
 	}
 
-	// 获取默认网关
-	defaultGateway := ""
+	// 检查是否是IPv6地址
+	isIPv6 := serverIP.To4() == nil
 
-	// 使用route命令获取默认网关
-	cmd := "cmd.exe /c \"route print 0.0.0.0 | findstr 0.0.0.0 | findstr /v 127.0.0.1 | findstr /v 0.0.0.0/0\""
-	output, _ := runCommand(cmd)
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) >= 3 {
-			defaultGateway = fields[2]
-			break
-		}
+	if isIPv6 {
+		// 如果是IPv6地址，添加IPv6特殊路由
+		addIPv6ServerRoute(serverIP)
+	} else {
+		// 如果是IPv4地址，添加IPv4特殊路由
+		addIPv4ServerRoute(serverIP)
+	}
+}
+
+// addIPv4ServerRoute 添加IPv4服务器特殊路由
+func addIPv4ServerRoute(serverIP net.IP) {
+	// 获取默认网关
+	defaultGateway, err := getDefaultGateway()
+	if err != nil {
+		log.Printf("获取默认IPv4网关失败: %v", err)
+		return
 	}
 
-	if defaultGateway != "" {
+	// 删除可能存在的路由
+	deleteCmd := fmt.Sprintf("route delete %s", serverIP.String())
+	_, _ = runCommand(deleteCmd)
+
+	// 添加服务器特殊路由，使用默认网关，使用非常低的metric值
+	addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask 255.255.255.255 %s metric 1\"", serverIP.String(), defaultGateway)
+	_, err = runCommand(addCmd)
+	if err == nil {
+		log.Printf("已添加IPv4服务器特殊路由: %s -> %s (优先级最高)", serverIP.String(), defaultGateway)
+	} else {
+		log.Printf("添加IPv4服务器特殊路由失败: %v", err)
+	}
+}
+
+// addIPv6ServerRoute 添加IPv6服务器特殊路由
+func addIPv6ServerRoute(serverIP net.IP) {
+	// 记录服务器IPv6地址，便于清理
+	serverIPv6Address = serverIP.String()
+
+	log.Printf("调试: 添加IPv6服务器特殊路由: %s", serverIP.String())
+	// 获取默认IPv6网关
+	defaultIPv6Gateway, err := getDefaultIPv6Gateway()
+	if err != nil {
+		log.Printf("获取默认IPv6网关失败: %v", err)
+		return
+	}
+
+	// 获取默认IPv6接口
+	defaultIPv6Interface, err := getDefaultIPv6Interface()
+	if err != nil {
+		log.Printf("获取默认IPv6接口失败: %v", err)
+		return
+	}
+
+	// 根据操作系统添加IPv6特殊路由
+	switch runtime.GOOS {
+	case "windows":
 		// 删除可能存在的路由
-		deleteCmd := fmt.Sprintf("route delete %s", serverIP.String())
+		deleteCmd := fmt.Sprintf("route -6 delete %s/128", serverIP.String())
 		_, _ = runCommand(deleteCmd)
 
-		// 添加服务器特殊路由，使用默认网关，使用非常低的metric值
-		addCmd := fmt.Sprintf("cmd.exe /c \"route add %s mask 255.255.255.255 %s metric 1\"", serverIP.String(), defaultGateway)
-		_, err = runCommand(addCmd)
-		if err == nil {
-			log.Printf("已添加服务器特殊路由: %s -> %s (优先级最高)", serverIP.String(), defaultGateway)
+		// 添加IPv6特殊路由
+		addCmd := fmt.Sprintf("netsh interface ipv6 add route %s/128 \"%s\" %s metric=1",
+			serverIP.String(), defaultIPv6Interface, defaultIPv6Gateway)
+		output, err := runCommand(addCmd)
+		if err != nil {
+			log.Printf("添加IPv6服务器特殊路由失败: %v, 输出: %s", err, output)
+
+			// 尝试使用替代方法
+			addCmd = fmt.Sprintf("route -6 add %s/128 %s if %s metric 1",
+				serverIP.String(), defaultIPv6Gateway, defaultIPv6Interface)
+			output, err = runCommand(addCmd)
+			if err != nil {
+				log.Printf("使用替代方法添加IPv6服务器特殊路由失败: %v, 输出: %s", err, output)
+			} else {
+				log.Printf("已添加IPv6服务器特殊路由: %s -> %s (接口: %s, 优先级最高)",
+					serverIP.String(), defaultIPv6Gateway, defaultIPv6Interface)
+			}
 		} else {
-			log.Printf("添加服务器特殊路由失败: %v", err)
+			log.Printf("已添加IPv6服务器特殊路由: %s -> %s (接口: %s, 优先级最高)",
+				serverIP.String(), defaultIPv6Gateway, defaultIPv6Interface)
 		}
-	} else {
-		log.Printf("无法获取默认网关，服务器特殊路由添加失败")
+
+	case "linux":
+		// 删除可能存在的路由
+		deleteCmd := fmt.Sprintf("ip -6 route del %s/128", serverIP.String())
+		_, _ = runCommand(deleteCmd)
+
+		// 添加IPv6特殊路由
+		addCmd := fmt.Sprintf("ip -6 route add %s/128 via %s dev %s metric 1",
+			serverIP.String(), defaultIPv6Gateway, defaultIPv6Interface)
+		output, err := runCommand(addCmd)
+		if err != nil {
+			log.Printf("添加IPv6服务器特殊路由失败: %v, 输出: %s", err, output)
+		} else {
+			log.Printf("已添加IPv6服务器特殊路由: %s -> %s (接口: %s, 优先级最高)",
+				serverIP.String(), defaultIPv6Gateway, defaultIPv6Interface)
+		}
+
+	case "darwin": // macOS
+		// 删除可能存在的路由
+		deleteCmd := fmt.Sprintf("route -n delete -inet6 %s/128", serverIP.String())
+		_, _ = runCommand(deleteCmd)
+
+		// 添加IPv6特殊路由
+		addCmd := fmt.Sprintf("route -n add -inet6 %s/128 %s -interface %s -priority 1",
+			serverIP.String(), defaultIPv6Gateway, defaultIPv6Interface)
+		output, err := runCommand(addCmd)
+		if err != nil {
+			log.Printf("添加IPv6服务器特殊路由失败: %v, 输出: %s", err, output)
+		} else {
+			log.Printf("已添加IPv6服务器特殊路由: %s -> %s (接口: %s, 优先级最高)",
+				serverIP.String(), defaultIPv6Gateway, defaultIPv6Interface)
+		}
+
+	default:
+		log.Printf("不支持的操作系统: %s", runtime.GOOS)
 	}
 }
 
