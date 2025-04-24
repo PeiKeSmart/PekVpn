@@ -54,7 +54,8 @@ var (
 	defaultTransport     http.RoundTripper // 原始Transport备份
 
 	// IPv6相关的全局变量
-	serverIPv6Address string // 服务器IPv6地址，用于清理特殊路由
+	serverIPv6Address   string // 服务器IPv6地址，用于清理特殊路由
+	serverIPv6Supported bool   // 服务器是否支持IPv6
 )
 
 func main() {
@@ -429,6 +430,12 @@ func main() {
 	// 清理资源
 	log.Printf("正在清理资源，恢复网络配置...")
 
+	// 如果服务器不支持IPv6，恢复IPv6功能
+	if !serverIPv6Supported {
+		log.Printf("服务器不支持IPv6，恢复IPv6功能...")
+		enableIPv6AfterVPN()
+	}
+
 	// 1. 先清理路由，顺序很重要
 	// 清理顺序很重要：先清理默认路由和VPN网段路由，最后再清理服务器特殊路由
 	// 这样可以确保在清理过程中，与VPN服务器的通信不会被中断
@@ -645,15 +652,19 @@ func createConfigFromKeys(serverPubKeyStr, privateKeyStr, endpoint, clientIPStr 
 		}
 		allowedIPs = append(allowedIPs, *allowedIPv4)
 
-		// 添加IPv6全局路由
-		_, allowedIPv6, parseErr := net.ParseCIDR("::/0")
-		if parseErr != nil {
-			return nil, fmt.Errorf("解析IPv6允许的IP失败: %v", parseErr)
+		// 检查服务器是否支持IPv6
+		if serverIPv6Supported {
+			// 添加IPv6全局路由
+			_, allowedIPv6, parseErr := net.ParseCIDR("::/0")
+			if parseErr != nil {
+				return nil, fmt.Errorf("解析IPv6允许的IP失败: %v", parseErr)
+			}
+			allowedIPs = append(allowedIPs, *allowedIPv6)
+			log.Printf("调试: 添加IPv6全局路由 ::/0 到AllowedIPs")
+			log.Printf("使用全局代理模式，所有IPv4和IPv6流量将通过VPN")
+		} else {
+			log.Printf("服务器不支持IPv6，仅IPv4流量将通过VPN")
 		}
-		allowedIPs = append(allowedIPs, *allowedIPv6)
-		log.Printf("调试: 添加IPv6全局路由 ::/0 到AllowedIPs")
-
-		log.Printf("使用全局代理模式，所有IPv4和IPv6流量将通过VPN")
 	} else {
 		// 分流模式，只允许VPN网段的流量
 		_, allowedIPv4, parseErr := net.ParseCIDR("10.9.0.0/24")
@@ -662,14 +673,18 @@ func createConfigFromKeys(serverPubKeyStr, privateKeyStr, endpoint, clientIPStr 
 		}
 		allowedIPs = append(allowedIPs, *allowedIPv4)
 
-		// 添加IPv6 VPN网段
-		_, allowedIPv6, parseErr := net.ParseCIDR("fd86:ea04:1115::/64")
-		if parseErr != nil {
-			return nil, fmt.Errorf("解析IPv6允许的IP失败: %v", parseErr)
+		// 检查服务器是否支持IPv6
+		if serverIPv6Supported {
+			// 添加IPv6 VPN网段
+			_, allowedIPv6, parseErr := net.ParseCIDR("fd86:ea04:1115::/64")
+			if parseErr != nil {
+				return nil, fmt.Errorf("解析IPv6允许的IP失败: %v", parseErr)
+			}
+			allowedIPs = append(allowedIPs, *allowedIPv6)
+			log.Printf("使用分流模式，只允许VPN网段的IPv4和IPv6流量")
+		} else {
+			log.Printf("服务器不支持IPv6，仅VPN网段的IPv4流量将通过VPN")
 		}
-		allowedIPs = append(allowedIPs, *allowedIPv6)
-
-		log.Printf("使用分流模式，只允许VPN网段的IPv4和IPv6流量")
 	}
 
 	// 创建配置
@@ -823,10 +838,11 @@ type RegistrationRequest struct {
 
 // RegistrationResponse 客户端注册响应结构
 type RegistrationResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-	IP      string `json:"ip,omitempty"`
-	IPv6    string `json:"ipv6,omitempty"` // 添加IPv6地址字段
+	Success       bool   `json:"success"`
+	Message       string `json:"message"`
+	IP            string `json:"ip,omitempty"`
+	IPv6          string `json:"ipv6,omitempty"` // IPv6地址字段
+	IPv6Supported bool   `json:"ipv6_supported"` // 服务器是否支持IPv6
 }
 
 // registerClientWithServer 向服务器注册客户端
@@ -920,11 +936,21 @@ func registerClientWithServer(serverEndpoint string, clientPublicKey wgtypes.Key
 
 		log.Printf("注册成功: %s", response.Message)
 
-		// 记录服务器分配的IPv6地址
+		// 记录服务器分配的IPv6地址和IPv6支持状态
 		if response.IPv6 != "" {
 			log.Printf("服务器分配的IPv6地址: %s", response.IPv6)
 			// 将IPv6地址保存到全局变量，便于后续使用
 			serverIPv6Address = response.IPv6
+		}
+
+		// 记录服务器IPv6支持状态
+		serverIPv6Supported = response.IPv6Supported
+		if serverIPv6Supported {
+			log.Printf("服务器支持IPv6，将启用IPv6功能")
+		} else {
+			log.Printf("服务器不支持IPv6，将禁用IPv6功能")
+			// 动态禁用IPv6功能
+			disableIPv6ForVPN()
 		}
 
 		return response.IP, nil
@@ -953,14 +979,18 @@ func generateNewConfig(endpoint, clientIPStr string) (*wireguard.Config, error) 
 		}
 		allowedIPs = append(allowedIPs, *allowedIPv4)
 
-		// 添加IPv6全局路由
-		_, allowedIPv6, parseErr := net.ParseCIDR("::/0")
-		if parseErr != nil {
-			return nil, fmt.Errorf("解析IPv6允许的IP失败: %v", parseErr)
+		// 检查服务器是否支持IPv6
+		if serverIPv6Supported {
+			// 添加IPv6全局路由
+			_, allowedIPv6, parseErr := net.ParseCIDR("::/0")
+			if parseErr != nil {
+				return nil, fmt.Errorf("解析IPv6允许的IP失败: %v", parseErr)
+			}
+			allowedIPs = append(allowedIPs, *allowedIPv6)
+			log.Printf("使用全局代理模式，所有IPv4和IPv6流量将通过VPN")
+		} else {
+			log.Printf("服务器不支持IPv6，仅IPv4流量将通过VPN")
 		}
-		allowedIPs = append(allowedIPs, *allowedIPv6)
-
-		log.Printf("使用全局代理模式，所有IPv4和IPv6流量将通过VPN")
 	} else {
 		// 分流模式，只允许VPN网段的流量
 		_, allowedIPv4, parseErr := net.ParseCIDR("10.9.0.0/24")
@@ -969,14 +999,18 @@ func generateNewConfig(endpoint, clientIPStr string) (*wireguard.Config, error) 
 		}
 		allowedIPs = append(allowedIPs, *allowedIPv4)
 
-		// 添加IPv6 VPN网段
-		_, allowedIPv6, parseErr := net.ParseCIDR("fd86:ea04:1115::/64")
-		if parseErr != nil {
-			return nil, fmt.Errorf("解析IPv6允许的IP失败: %v", parseErr)
+		// 检查服务器是否支持IPv6
+		if serverIPv6Supported {
+			// 添加IPv6 VPN网段
+			_, allowedIPv6, parseErr := net.ParseCIDR("fd86:ea04:1115::/64")
+			if parseErr != nil {
+				return nil, fmt.Errorf("解析IPv6允许的IP失败: %v", parseErr)
+			}
+			allowedIPs = append(allowedIPs, *allowedIPv6)
+			log.Printf("使用分流模式，只允许VPN网段的IPv4和IPv6流量")
+		} else {
+			log.Printf("服务器不支持IPv6，仅VPN网段的IPv4流量将通过VPN")
 		}
-		allowedIPs = append(allowedIPs, *allowedIPv6)
-
-		log.Printf("使用分流模式，只允许VPN网段的IPv4和IPv6流量")
 	}
 
 	// 尝试从服务器获取公钥
@@ -1188,7 +1222,12 @@ func addRoute(network, tunName string) error {
 	// 检查是否是IPv6路由
 	_, ipNet, err := net.ParseCIDR(network)
 	if err == nil && ipNet.IP.To4() == nil {
-		log.Printf("调试: 添加IPv6路由: %s", network)
+		// 检查服务器是否支持IPv6
+		if !serverIPv6Supported {
+			log.Printf("服务器不支持IPv6，跳过添加IPv6路由: %s", network)
+			return nil
+		}
+		log.Printf("服务器支持IPv6，添加IPv6路由: %s", network)
 	}
 
 	// 最多重试3次
@@ -3709,6 +3748,198 @@ func addIPv4ServerRoute(serverIP net.IP) {
 	} else {
 		log.Printf("添加IPv4服务器特殊路由失败: %v", err)
 	}
+}
+
+// disableIPv6ForVPN 动态禁用IPv6功能（不需要重启）
+func disableIPv6ForVPN() {
+	log.Printf("正在动态禁用IPv6功能...")
+
+	switch runtime.GOOS {
+	case "windows":
+		// 在Windows上，我们可以通过禁用IPv6路由来实现
+		log.Printf("在Windows上禁用IPv6路由...")
+
+		// 1. 删除所有IPv6默认路由
+		cmd := "route -6 delete ::/0"
+		output, err := runCommand(cmd)
+		if err != nil {
+			log.Printf("删除IPv6默认路由失败: %v, 输出: %s", err, output)
+
+			// 尝试使用PowerShell命令
+			cmd = "Remove-NetRoute -DestinationPrefix ::/0 -Confirm:$false -ErrorAction SilentlyContinue"
+			output, err = runCommand(cmd)
+			if err != nil {
+				log.Printf("使用PowerShell删除IPv6默认路由失败: %v, 输出: %s", err, output)
+			} else {
+				log.Printf("成功删除IPv6默认路由")
+			}
+		} else {
+			log.Printf("成功删除IPv6默认路由")
+		}
+
+		// 2. 禁用IPv6流量优先级
+		cmd = "netsh interface ipv6 set prefixpolicy ::ffff:0:0/96 45 4"
+		output, err = runCommand(cmd)
+		if err != nil {
+			log.Printf("设置IPv6前缀策略失败: %v, 输出: %s", err, output)
+		} else {
+			log.Printf("成功设置IPv6前缀策略，IPv4流量将优先于IPv6")
+		}
+
+		// 3. 禁用所有网络适配器的IPv6
+		cmd = "Get-NetAdapter | ForEach-Object { Disable-NetAdapterBinding -InterfaceAlias $_.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue }"
+		output, err = runCommand(cmd)
+		if err != nil {
+			log.Printf("禁用网络适配器IPv6失败: %v, 输出: %s", err, output)
+
+			// 尝试使用netsh命令
+			cmd = "netsh interface ipv6 set global randomizeidentifiers=disabled"
+			_, _ = runCommand(cmd)
+
+			cmd = "netsh interface ipv6 set privacy state=disabled"
+			_, _ = runCommand(cmd)
+
+			log.Printf("已使用netsh命令降低IPv6优先级")
+		} else {
+			log.Printf("成功禁用所有网络适配器的IPv6")
+		}
+
+	case "linux":
+		// 在Linux上，我们可以通过设置sysctl参数来禁用IPv6
+		log.Printf("在Linux上禁用IPv6...")
+
+		// 1. 禁用所有接口的IPv6
+		cmd := "sysctl -w net.ipv6.conf.all.disable_ipv6=1"
+		output, err := runCommand(cmd)
+		if err != nil {
+			log.Printf("禁用所有接口IPv6失败: %v, 输出: %s", err, output)
+		} else {
+			log.Printf("成功禁用所有接口的IPv6")
+		}
+
+		// 2. 禁用默认接口的IPv6
+		cmd = "sysctl -w net.ipv6.conf.default.disable_ipv6=1"
+		output, err = runCommand(cmd)
+		if err != nil {
+			log.Printf("禁用默认接口IPv6失败: %v, 输出: %s", err, output)
+		} else {
+			log.Printf("成功禁用默认接口的IPv6")
+		}
+
+		// 3. 禁用IPv6转发
+		cmd = "sysctl -w net.ipv6.conf.all.forwarding=0"
+		_, _ = runCommand(cmd)
+
+	case "darwin": // macOS
+		// 在macOS上，我们可以通过设置网络服务优先级来实现
+		log.Printf("在macOS上禁用IPv6...")
+
+		// 1. 获取当前活跃的网络服务
+		cmd := "networksetup -listnetworkserviceorder | grep '(1)' | awk -F: '{print $2}' | awk '{$1=$1};1'"
+		primaryService, err := runCommand(cmd)
+		primaryService = strings.TrimSpace(primaryService)
+		if err != nil || primaryService == "" {
+			log.Printf("获取主要网络服务失败: %v", err)
+		} else {
+			// 2. 禁用该服务的IPv6
+			cmd = fmt.Sprintf("networksetup -setv6off \"%s\"", primaryService)
+			output, err := runCommand(cmd)
+			if err != nil {
+				log.Printf("禁用IPv6失败: %v, 输出: %s", err, output)
+			} else {
+				log.Printf("成功禁用网络服务 \"%s\" 的IPv6", primaryService)
+			}
+		}
+	}
+
+	log.Printf("IPv6功能已动态禁用，VPN将仅使用IPv4")
+}
+
+// enableIPv6AfterVPN 在VPN关闭后恢复IPv6功能
+func enableIPv6AfterVPN() {
+	log.Printf("正在恢复IPv6功能...")
+
+	switch runtime.GOOS {
+	case "windows":
+		// 在Windows上，我们需要重新启用IPv6
+		log.Printf("在Windows上恢复IPv6功能...")
+
+		// 1. 恢复IPv6前缀策略
+		cmd := "netsh interface ipv6 set prefixpolicy ::ffff:0:0/96 35 4"
+		output, err := runCommand(cmd)
+		if err != nil {
+			log.Printf("恢复IPv6前缀策略失败: %v, 输出: %s", err, output)
+		} else {
+			log.Printf("成功恢复IPv6前缀策略")
+		}
+
+		// 2. 重新启用所有网络适配器的IPv6
+		cmd = "Get-NetAdapter | ForEach-Object { Enable-NetAdapterBinding -InterfaceAlias $_.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue }"
+		output, err = runCommand(cmd)
+		if err != nil {
+			log.Printf("重新启用网络适配器IPv6失败: %v, 输出: %s", err, output)
+
+			// 尝试使用netsh命令
+			cmd = "netsh interface ipv6 set global randomizeidentifiers=enabled"
+			_, _ = runCommand(cmd)
+
+			cmd = "netsh interface ipv6 set privacy state=enabled"
+			_, _ = runCommand(cmd)
+
+			log.Printf("已使用netsh命令恢复IPv6设置")
+		} else {
+			log.Printf("成功重新启用所有网络适配器的IPv6")
+		}
+
+		// 3. 重新启用IPv6自动配置
+		cmd = "netsh interface ipv6 set interface interface=* routerdiscovery=enabled"
+		_, _ = runCommand(cmd)
+
+	case "linux":
+		// 在Linux上，我们需要重新启用IPv6
+		log.Printf("在Linux上恢复IPv6功能...")
+
+		// 1. 重新启用所有接口的IPv6
+		cmd := "sysctl -w net.ipv6.conf.all.disable_ipv6=0"
+		output, err := runCommand(cmd)
+		if err != nil {
+			log.Printf("重新启用所有接口IPv6失败: %v, 输出: %s", err, output)
+		} else {
+			log.Printf("成功重新启用所有接口的IPv6")
+		}
+
+		// 2. 重新启用默认接口的IPv6
+		cmd = "sysctl -w net.ipv6.conf.default.disable_ipv6=0"
+		output, err = runCommand(cmd)
+		if err != nil {
+			log.Printf("重新启用默认接口IPv6失败: %v, 输出: %s", err, output)
+		} else {
+			log.Printf("成功重新启用默认接口的IPv6")
+		}
+
+	case "darwin": // macOS
+		// 在macOS上，我们需要重新启用IPv6
+		log.Printf("在macOS上恢复IPv6功能...")
+
+		// 1. 获取当前活跃的网络服务
+		cmd := "networksetup -listnetworkserviceorder | grep '(1)' | awk -F: '{print $2}' | awk '{$1=$1};1'"
+		primaryService, err := runCommand(cmd)
+		primaryService = strings.TrimSpace(primaryService)
+		if err != nil || primaryService == "" {
+			log.Printf("获取主要网络服务失败: %v", err)
+		} else {
+			// 2. 重新启用该服务的IPv6
+			cmd = fmt.Sprintf("networksetup -setv6automatic \"%s\"", primaryService)
+			output, err := runCommand(cmd)
+			if err != nil {
+				log.Printf("重新启用IPv6失败: %v, 输出: %s", err, output)
+			} else {
+				log.Printf("成功重新启用网络服务 \"%s\" 的IPv6", primaryService)
+			}
+		}
+	}
+
+	log.Printf("IPv6功能已恢复")
 }
 
 // addIPv6ServerRoute 添加IPv6服务器特殊路由
