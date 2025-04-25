@@ -44,6 +44,9 @@ var (
 	// IP地址分配
 	nextIP = net.ParseIP("10.8.0.2").To4()
 	ipLock sync.Mutex
+
+	// IPv6支持状态
+	ipv6Supported bool // 服务器是否支持IPv6
 )
 
 func main() {
@@ -67,6 +70,14 @@ func main() {
 	}
 
 	log.Printf("启动WireGuard VPN服务器...")
+
+	// 检测IPv6支持
+	ipv6Supported = checkIPv6Support()
+	if ipv6Supported {
+		log.Printf("服务器支持IPv6，将启用IPv6功能")
+	} else {
+		log.Printf("服务器不支持IPv6，将禁用IPv6功能")
+	}
 
 	// 解析IP地址和子网掩码
 	ip, ipNet, err := net.ParseCIDR(*tunIP)
@@ -127,6 +138,19 @@ func main() {
 	log.Printf("监听端口: %d", *listenPort)
 	log.Printf("服务器公钥: %s", config.PublicKey.String())
 	log.Printf("TUN设备: %s, IP: %s", wgDevice.TunName, *tunIP)
+
+	// 输出IPv6支持状态和服务器公网IPv6地址
+	if ipv6Supported {
+		// 获取服务器的公网IPv6地址
+		serverIPv6 := getServerIPv6()
+		if serverIPv6 != "" {
+			log.Printf("服务器公网IPv6地址: %s", serverIPv6)
+		} else {
+			log.Printf("服务器支持IPv6，但未检测到公网IPv6地址")
+		}
+	} else {
+		log.Printf("服务器不支持IPv6，IPv6功能已禁用")
+	}
 
 	// 保存配置文件
 	saveConfig(config)
@@ -503,6 +527,287 @@ func generateClientConfig(serverConfig *wireguard.Config, clientName string) (*w
 	return serverPeerConfig, nil
 }
 
+// checkIPv6Support 检测服务器是否支持IPv6
+func checkIPv6Support() bool {
+	log.Printf("正在检测服务器IPv6支持情况...")
+
+	switch runtime.GOOS {
+	case "linux":
+		// 检查是否有IPv6地址
+		cmd := "ip -6 addr show"
+		output, err := runCommand(cmd)
+		if err != nil {
+			log.Printf("检测IPv6地址失败: %v", err)
+			return false
+		}
+
+		// 检查是否有非本地IPv6地址
+		if !strings.Contains(output, "scope global") && !strings.Contains(output, "2001:") && !strings.Contains(output, "2002:") && !strings.Contains(output, "2003:") {
+			log.Printf("未检测到全局IPv6地址")
+			return false
+		}
+
+		// 检查IPv6转发是否启用
+		cmd = "sysctl -a | grep -E 'net.ipv6.conf.(all|default).forwarding'"
+		output, err = runCommand(cmd)
+		if err != nil || !strings.Contains(output, "= 1") {
+			log.Printf("IPv6转发未启用: %s", output)
+			return false
+		}
+
+		// 检查ip6tables是否可用
+		cmd = "which ip6tables"
+		_, err = runCommand(cmd)
+		if err != nil {
+			log.Printf("ip6tables不可用，无法配置IPv6防火墙")
+			return false
+		}
+
+		// 尝试ping IPv6地址（使用百度的IPv6地址，适合中国大陆网络环境）
+		cmd = "ping6 -c 1 -W 2 ipv6.baidu.com"
+		_, err = runCommand(cmd)
+		if err != nil {
+			// 尝试备用IPv6地址（阿里云的IPv6地址）
+			cmd = "ping6 -c 1 -W 2 ipv6.aliyun.com"
+			_, err = runCommand(cmd)
+			if err != nil {
+				log.Printf("无法ping通公共IPv6地址，尝试ping本地IPv6地址")
+
+				// 尝试ping本地IPv6地址
+				cmd = "ping6 -c 1 -W 2 ::1"
+				_, err = runCommand(cmd)
+				if err != nil {
+					log.Printf("无法ping通本地IPv6地址，IPv6协议栈可能未正确配置")
+					return false
+				} else {
+					log.Printf("可以ping通本地IPv6地址，但无法访问公共IPv6网络")
+					// 仍然返回true，因为本地IPv6栈是正常的，可能只是没有公网IPv6连接
+					return true
+				}
+			}
+		}
+
+		log.Printf("服务器支持IPv6")
+		return true
+
+	case "darwin": // macOS
+		// 检查是否有IPv6地址
+		cmd := "ifconfig | grep inet6"
+		output, err := runCommand(cmd)
+		if err != nil || !strings.Contains(output, "inet6") {
+			log.Printf("未检测到IPv6地址")
+			return false
+		}
+
+		// 尝试ping IPv6地址（使用百度的IPv6地址，适合中国大陆网络环境）
+		cmd = "ping6 -c 1 -W 2 ipv6.baidu.com"
+		_, err = runCommand(cmd)
+		if err != nil {
+			// 尝试备用IPv6地址（阿里云的IPv6地址）
+			cmd = "ping6 -c 1 -W 2 ipv6.aliyun.com"
+			_, err = runCommand(cmd)
+			if err != nil {
+				log.Printf("无法ping通公共IPv6地址，尝试ping本地IPv6地址")
+
+				// 尝试ping本地IPv6地址
+				cmd = "ping6 -c 1 -W 2 ::1"
+				_, err = runCommand(cmd)
+				if err != nil {
+					log.Printf("无法ping通本地IPv6地址，IPv6协议栈可能未正确配置")
+					return false
+				} else {
+					log.Printf("可以ping通本地IPv6地址，但无法访问公共IPv6网络")
+					// 仍然返回true，因为本地IPv6栈是正常的，可能只是没有公网IPv6连接
+					return true
+				}
+			}
+		}
+
+		log.Printf("服务器支持IPv6")
+		return true
+
+	case "windows":
+		// 检查是否有IPv6地址
+		cmd := "Get-NetIPAddress -AddressFamily IPv6 | Where-Object { $_.PrefixOrigin -ne 'WellKnown' }"
+		output, err := runCommand(cmd)
+		if err != nil || output == "" {
+			log.Printf("未检测到非本地IPv6地址")
+
+			// 再次检查是否有任何IPv6地址
+			cmd = "Get-NetIPAddress -AddressFamily IPv6"
+			output, err = runCommand(cmd)
+			if err != nil || output == "" {
+				log.Printf("未检测到任何IPv6地址")
+				return false
+			}
+		}
+
+		// 检查IPv6转发是否启用
+		cmd = "Get-NetIPInterface -AddressFamily IPv6 | Where-Object { $_.Forwarding -eq 'Enabled' }"
+		output, err = runCommand(cmd)
+		if err != nil || output == "" {
+			log.Printf("IPv6转发未启用")
+			// 不要立即返回false，因为我们可能可以启用它
+		}
+
+		// 检查是否可以创建IPv6 NAT
+		cmd = "Get-Command New-NetNat -ErrorAction SilentlyContinue"
+		output, err = runCommand(cmd)
+		if err != nil || !strings.Contains(output, "New-NetNat") {
+			log.Printf("New-NetNat命令不可用，无法创建IPv6 NAT")
+			return false
+		}
+
+		// 尝试ping IPv6地址（使用百度的IPv6地址，适合中国大陆网络环境）
+		cmd = "Test-Connection -ComputerName ipv6.baidu.com -Count 1 -IPv6 -ErrorAction SilentlyContinue"
+		_, err = runCommand(cmd)
+		if err != nil {
+			// 尝试备用IPv6地址（阿里云的IPv6地址）
+			cmd = "Test-Connection -ComputerName ipv6.aliyun.com -Count 1 -IPv6 -ErrorAction SilentlyContinue"
+			_, err = runCommand(cmd)
+			if err != nil {
+				log.Printf("无法ping通公共IPv6地址，尝试ping本地IPv6地址")
+
+				// 尝试ping本地IPv6地址
+				cmd = "Test-Connection -ComputerName ::1 -Count 1 -IPv6 -ErrorAction SilentlyContinue"
+				_, err = runCommand(cmd)
+				if err != nil {
+					log.Printf("无法ping通本地IPv6地址，IPv6协议栈可能未正确配置")
+					return false
+				} else {
+					log.Printf("可以ping通本地IPv6地址，但无法访问公共IPv6网络")
+					// 仍然返回true，因为本地IPv6栈是正常的，可能只是没有公网IPv6连接
+					return true
+				}
+			}
+		}
+
+		log.Printf("服务器支持IPv6")
+		return true
+
+	default:
+		log.Printf("不支持的操作系统: %s，默认禁用IPv6", runtime.GOOS)
+		return false
+	}
+}
+
+// getServerIPv6 获取服务器IPv6地址
+func getServerIPv6() string {
+	// 如果服务器不支持IPv6，直接返回空字符串
+	if !ipv6Supported {
+		log.Printf("服务器不支持IPv6，返回空IPv6地址")
+		return ""
+	}
+
+	// 尝试获取服务器的公网IPv6地址
+	switch runtime.GOOS {
+	case "linux":
+		// 使用curl获取公网IPv6（尝试多个服务，适合中国大陆网络环境）
+		// 首先尝试ipify服务
+		cmd := "curl -s -6 https://api6.ipify.org"
+		output, err := runCommand(cmd)
+		if err == nil && output != "" && strings.Contains(output, ":") {
+			log.Printf("通过ipify获取到服务器公网IPv6地址: %s", strings.TrimSpace(output))
+			return strings.TrimSpace(output)
+		}
+
+		// 如果失败，尝试ip.sb服务
+		cmd = "curl -s -6 https://api-ipv6.ip.sb/ip"
+		output, err = runCommand(cmd)
+		if err == nil && output != "" && strings.Contains(output, ":") {
+			log.Printf("通过ip.sb获取到服务器公网IPv6地址: %s", strings.TrimSpace(output))
+			return strings.TrimSpace(output)
+		}
+
+		// 如果失败，尝试ipv6-test服务
+		cmd = "curl -s -6 https://ipv6-test.com/api/myip.php"
+		output, err = runCommand(cmd)
+		if err == nil && output != "" && strings.Contains(output, ":") {
+			log.Printf("通过ipv6-test获取到服务器公网IPv6地址: %s", strings.TrimSpace(output))
+			return strings.TrimSpace(output)
+		}
+
+		// 如果失败，尝试获取本地IPv6地址
+		cmd = "ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -n 1"
+		output, err = runCommand(cmd)
+		if err == nil && output != "" {
+			log.Printf("获取到服务器本地IPv6地址: %s", strings.TrimSpace(output))
+			return strings.TrimSpace(output)
+		}
+
+	case "darwin": // macOS
+		// 使用curl获取公网IPv6（尝试多个服务，适合中国大陆网络环境）
+		// 首先尝试ipify服务
+		cmd := "curl -s -6 https://api6.ipify.org"
+		output, err := runCommand(cmd)
+		if err == nil && output != "" && strings.Contains(output, ":") {
+			log.Printf("通过ipify获取到服务器公网IPv6地址: %s", strings.TrimSpace(output))
+			return strings.TrimSpace(output)
+		}
+
+		// 如果失败，尝试ip.sb服务
+		cmd = "curl -s -6 https://api-ipv6.ip.sb/ip"
+		output, err = runCommand(cmd)
+		if err == nil && output != "" && strings.Contains(output, ":") {
+			log.Printf("通过ip.sb获取到服务器公网IPv6地址: %s", strings.TrimSpace(output))
+			return strings.TrimSpace(output)
+		}
+
+		// 如果失败，尝试ipv6-test服务
+		cmd = "curl -s -6 https://ipv6-test.com/api/myip.php"
+		output, err = runCommand(cmd)
+		if err == nil && output != "" && strings.Contains(output, ":") {
+			log.Printf("通过ipv6-test获取到服务器公网IPv6地址: %s", strings.TrimSpace(output))
+			return strings.TrimSpace(output)
+		}
+
+		// 如果失败，尝试获取本地IPv6地址
+		cmd = "ifconfig | grep inet6 | grep -v fe80 | grep -v ::1 | awk '{print $2}' | head -n 1"
+		output, err = runCommand(cmd)
+		if err == nil && output != "" {
+			log.Printf("获取到服务器本地IPv6地址: %s", strings.TrimSpace(output))
+			return strings.TrimSpace(output)
+		}
+
+	case "windows":
+		// 使用PowerShell获取公网IPv6（尝试多个服务，适合中国大陆网络环境）
+		// 首先尝试ipify服务
+		cmd := "try { (Invoke-WebRequest -Uri 'https://api6.ipify.org' -UseBasicParsing -TimeoutSec 5).Content } catch { $null }"
+		output, err := runCommand(cmd)
+		if err == nil && output != "" && strings.Contains(output, ":") {
+			log.Printf("通过ipify获取到服务器公网IPv6地址: %s", strings.TrimSpace(output))
+			return strings.TrimSpace(output)
+		}
+
+		// 如果失败，尝试ip.sb服务
+		cmd = "try { (Invoke-WebRequest -Uri 'https://api-ipv6.ip.sb/ip' -UseBasicParsing -TimeoutSec 5).Content } catch { $null }"
+		output, err = runCommand(cmd)
+		if err == nil && output != "" && strings.Contains(output, ":") {
+			log.Printf("通过ip.sb获取到服务器公网IPv6地址: %s", strings.TrimSpace(output))
+			return strings.TrimSpace(output)
+		}
+
+		// 如果失败，尝试ipv6-test服务
+		cmd = "try { (Invoke-WebRequest -Uri 'https://ipv6-test.com/api/myip.php' -UseBasicParsing -TimeoutSec 5).Content } catch { $null }"
+		output, err = runCommand(cmd)
+		if err == nil && output != "" && strings.Contains(output, ":") {
+			log.Printf("通过ipv6-test获取到服务器公网IPv6地址: %s", strings.TrimSpace(output))
+			return strings.TrimSpace(output)
+		}
+
+		// 如果失败，尝试获取本地IPv6地址
+		cmd = "Get-NetIPAddress -AddressFamily IPv6 | Where-Object { $_.PrefixOrigin -ne 'WellKnown' -and $_.IPAddress -notlike 'fe80*' } | Select-Object -First 1 -ExpandProperty IPAddress"
+		output, err = runCommand(cmd)
+		if err == nil && output != "" {
+			log.Printf("获取到服务器本地IPv6地址: %s", strings.TrimSpace(output))
+			return strings.TrimSpace(output)
+		}
+	}
+
+	log.Printf("无法获取服务器IPv6地址，返回空字符串")
+	return ""
+}
+
 // getServerIP 获取服务器IP地址
 func getServerIP() string {
 	// 尝试获取服务器的公网IP
@@ -670,55 +975,59 @@ func configureNAT(vpnNetwork string) error {
 			return fmt.Errorf("配置IPv4转发规则失败: %v", err)
 		}
 
-		// 配置IPv6 NAT
-		log.Printf("配置IPv6 NAT...")
+		// 配置IPv6 NAT（如果服务器支持IPv6）
+		if ipv6Supported {
+			log.Printf("配置IPv6 NAT...")
 
-		// 检查ip6tables是否可用
-		cmd = "which ip6tables"
-		_, err = runCommand(cmd)
-		if err != nil {
-			log.Printf("警告: ip6tables不可用，跳过IPv6 NAT配置")
+			// 检查ip6tables是否可用
+			cmd = "which ip6tables"
+			_, err = runCommand(cmd)
+			if err != nil {
+				log.Printf("警告: ip6tables不可用，跳过IPv6 NAT配置")
+			} else {
+				// 检查当前的IPv6路由和转发设置
+				cmd = "sysctl -a | grep -E 'net.ipv6.conf.(all|default).forwarding'"
+				output, _ := runCommand(cmd)
+				log.Printf("调试: 当前IPv6转发设置:\n%s", output)
+
+				// 启用IPv6转发
+				cmd = "sysctl -w net.ipv6.conf.all.forwarding=1"
+				_, err = runCommand(cmd)
+				if err != nil {
+					log.Printf("警告: 启用IPv6转发失败: %v", err)
+				} else {
+					log.Printf("成功启用IPv6转发")
+				}
+
+				// 配置IPv6 NAT
+				cmd = fmt.Sprintf("ip6tables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE", ipv6Network, iface)
+				output, err = runCommand(cmd)
+				if err != nil {
+					log.Printf("警告: 配置IPv6 NAT失败: %v, 输出: %s", err, output)
+				} else {
+					log.Printf("成功配置IPv6 NAT")
+				}
+
+				// 检查当前的IPv6 NAT设置
+				cmd = "ip6tables -t nat -L -v"
+				output, _ = runCommand(cmd)
+				log.Printf("调试: 当前IPv6 NAT设置:\n%s", output)
+
+				// 允许IPv6转发
+				cmd = fmt.Sprintf("ip6tables -A FORWARD -s %s -j ACCEPT", ipv6Network)
+				_, err = runCommand(cmd)
+				if err != nil {
+					log.Printf("警告: 配置IPv6转发规则失败: %v", err)
+				}
+
+				cmd = fmt.Sprintf("ip6tables -A FORWARD -d %s -j ACCEPT", ipv6Network)
+				_, err = runCommand(cmd)
+				if err != nil {
+					log.Printf("警告: 配置IPv6转发规则失败: %v", err)
+				}
+			}
 		} else {
-			// 检查当前的IPv6路由和转发设置
-			cmd = "sysctl -a | grep -E 'net.ipv6.conf.(all|default).forwarding'"
-			output, _ := runCommand(cmd)
-			log.Printf("调试: 当前IPv6转发设置:\n%s", output)
-
-			// 启用IPv6转发
-			cmd = "sysctl -w net.ipv6.conf.all.forwarding=1"
-			_, err = runCommand(cmd)
-			if err != nil {
-				log.Printf("警告: 启用IPv6转发失败: %v", err)
-			} else {
-				log.Printf("成功启用IPv6转发")
-			}
-
-			// 配置IPv6 NAT
-			cmd = fmt.Sprintf("ip6tables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE", ipv6Network, iface)
-			output, err = runCommand(cmd)
-			if err != nil {
-				log.Printf("警告: 配置IPv6 NAT失败: %v, 输出: %s", err, output)
-			} else {
-				log.Printf("成功配置IPv6 NAT")
-			}
-
-			// 检查当前的IPv6 NAT设置
-			cmd = "ip6tables -t nat -L -v"
-			output, _ = runCommand(cmd)
-			log.Printf("调试: 当前IPv6 NAT设置:\n%s", output)
-
-			// 允许IPv6转发
-			cmd = fmt.Sprintf("ip6tables -A FORWARD -s %s -j ACCEPT", ipv6Network)
-			_, err = runCommand(cmd)
-			if err != nil {
-				log.Printf("警告: 配置IPv6转发规则失败: %v", err)
-			}
-
-			cmd = fmt.Sprintf("ip6tables -A FORWARD -d %s -j ACCEPT", ipv6Network)
-			_, err = runCommand(cmd)
-			if err != nil {
-				log.Printf("警告: 配置IPv6转发规则失败: %v", err)
-			}
+			log.Printf("服务器不支持IPv6，跳过IPv6 NAT配置")
 		}
 
 		return nil
@@ -743,14 +1052,18 @@ func configureNAT(vpnNetwork string) error {
 			return fmt.Errorf("配置IPv4 NAT失败: %v", err)
 		}
 
-		// 配置IPv6 NAT
-		log.Printf("配置IPv6 NAT...")
-		cmd = fmt.Sprintf("echo 'nat on %s from %s to any -> (%s)' | sudo pfctl -f -", iface, ipv6Network, iface)
-		_, err = runCommand(cmd)
-		if err != nil {
-			log.Printf("警告: 配置IPv6 NAT失败: %v", err)
+		// 配置IPv6 NAT（如果服务器支持IPv6）
+		if ipv6Supported {
+			log.Printf("配置IPv6 NAT...")
+			cmd = fmt.Sprintf("echo 'nat on %s from %s to any -> (%s)' | sudo pfctl -f -", iface, ipv6Network, iface)
+			_, err = runCommand(cmd)
+			if err != nil {
+				log.Printf("警告: 配置IPv6 NAT失败: %v", err)
+			} else {
+				log.Printf("成功配置IPv6 NAT")
+			}
 		} else {
-			log.Printf("成功配置IPv6 NAT")
+			log.Printf("服务器不支持IPv6，跳过IPv6 NAT配置")
 		}
 
 		// 启用pfctl
@@ -798,21 +1111,26 @@ func configureNAT(vpnNetwork string) error {
 			log.Printf("使用IPv4 NetNat失败: %v", err)
 		}
 
-		// 创建IPv6 NAT
-		ipv6NatName := fmt.Sprintf("WireGuardIPv6NAT_%d", time.Now().Unix())
-		log.Printf("尝试创建IPv6 NAT: %s", ipv6NatName)
-		cmd = fmt.Sprintf("New-NetNat -Name \"%s\" -InternalIPInterfaceAddressPrefix %s -ErrorAction SilentlyContinue", ipv6NatName, ipv6Network)
-		_, err = runCommand(cmd)
-		if err == nil {
-			log.Printf("成功创建IPv6 NAT: %s", ipv6NatName)
-			ipv6NatConfigured = true
+		// 创建IPv6 NAT（如果服务器支持IPv6）
+		if ipv6Supported {
+			ipv6NatName := fmt.Sprintf("WireGuardIPv6NAT_%d", time.Now().Unix())
+			log.Printf("尝试创建IPv6 NAT: %s", ipv6NatName)
+			cmd = fmt.Sprintf("New-NetNat -Name \"%s\" -InternalIPInterfaceAddressPrefix %s -ErrorAction SilentlyContinue", ipv6NatName, ipv6Network)
+			_, err = runCommand(cmd)
+			if err == nil {
+				log.Printf("成功创建IPv6 NAT: %s", ipv6NatName)
+				ipv6NatConfigured = true
 
-			// 验证NAT配置
-			cmd = "Get-NetNat -ErrorAction SilentlyContinue | Format-Table"
-			output, _ = runCommand(cmd)
-			log.Printf("当前NAT配置包括IPv6:\n%s", output)
+				// 验证NAT配置
+				cmd = "Get-NetNat -ErrorAction SilentlyContinue | Format-Table"
+				output, _ = runCommand(cmd)
+				log.Printf("当前NAT配置包括IPv6:\n%s", output)
+			} else {
+				log.Printf("使用IPv6 NetNat失败: %v", err)
+			}
 		} else {
-			log.Printf("使用IPv6 NetNat失败: %v", err)
+			log.Printf("服务器不支持IPv6，跳过创建IPv6 NAT")
+			ipv6NatConfigured = false
 		}
 
 		// 3. 如果NetNat失败，尝试使用Internet连接共享(ICS)
@@ -909,21 +1227,26 @@ func configureNAT(vpnNetwork string) error {
 				log.Printf("已使用netsh命令配置IPv4转发")
 				natConfigured = true
 
-				// 为外部接口启用IPv6转发
-				cmd = fmt.Sprintf("netsh interface ipv6 set interface %s forwarding=enabled", externalIndex)
-				_, err = runCommand(cmd)
-				if err != nil {
-					log.Printf("启用IPv6转发失败: %v", err)
-				} else {
-					// 为WireGuard接口启用IPv6转发
-					cmd = fmt.Sprintf("netsh interface ipv6 set interface %s forwarding=enabled", wgIndex)
+				// 为外部接口启用IPv6转发（如果服务器支持IPv6）
+				if ipv6Supported {
+					cmd = fmt.Sprintf("netsh interface ipv6 set interface %s forwarding=enabled", externalIndex)
 					_, err = runCommand(cmd)
 					if err != nil {
-						log.Printf("启用WireGuard IPv6转发失败: %v", err)
+						log.Printf("启用IPv6转发失败: %v", err)
 					} else {
-						log.Printf("已使用netsh命令配置IPv6转发")
-						ipv6NatConfigured = true
+						// 为WireGuard接口启用IPv6转发
+						cmd = fmt.Sprintf("netsh interface ipv6 set interface %s forwarding=enabled", wgIndex)
+						_, err = runCommand(cmd)
+						if err != nil {
+							log.Printf("启用WireGuard IPv6转发失败: %v", err)
+						} else {
+							log.Printf("已使用netsh命令配置IPv6转发")
+							ipv6NatConfigured = true
+						}
 					}
+				} else {
+					log.Printf("服务器不支持IPv6，跳过IPv6转发配置")
+					ipv6NatConfigured = false
 				}
 			}
 		}
@@ -990,9 +1313,14 @@ func addSpecificClient(serverConfig *wireguard.Config, wgDevice *wireguard.WireG
 	_, allowedIPv4, _ := net.ParseCIDR("0.0.0.0/0")
 	allowedIPs := []net.IPNet{*allowedIPv4}
 
-	// 创建允许的IPv6
-	_, allowedIPv6, _ := net.ParseCIDR("::/0")
-	allowedIPs = append(allowedIPs, *allowedIPv6)
+	// 创建允许的IPv6（如果服务器支持IPv6）
+	if ipv6Supported {
+		_, allowedIPv6, _ := net.ParseCIDR("::/0")
+		allowedIPs = append(allowedIPs, *allowedIPv6)
+		log.Printf("添加IPv6全局路由到AllowedIPs")
+	} else {
+		log.Printf("服务器不支持IPv6，跳过添加IPv6全局路由")
+	}
 
 	// 创建客户端配置
 	clientConfig := &wireguard.Config{
@@ -1003,14 +1331,21 @@ func addSpecificClient(serverConfig *wireguard.Config, wgDevice *wireguard.WireG
 	// 分配IP地址
 	clientIP := allocateIP()
 
-	// 分配IPv6地址
-	ipv6Prefix := "fd86:ea04:1115::"
-	ipv4Parts := strings.Split(clientIP.String(), ".")
-	ipv6Suffix := ""
-	for _, part := range ipv4Parts {
-		ipv6Suffix += fmt.Sprintf("%02x", atoi(part))
+	// 分配IPv6地址（如果服务器支持IPv6）
+	var clientIPv6 net.IP
+	if ipv6Supported {
+		ipv6Prefix := "fd86:ea04:1115::"
+		ipv4Parts := strings.Split(clientIP.String(), ".")
+		ipv6Suffix := ""
+		for _, part := range ipv4Parts {
+			ipv6Suffix += fmt.Sprintf("%02x", atoi(part))
+		}
+		clientIPv6 = net.ParseIP(ipv6Prefix + ipv6Suffix)
+		log.Printf("为客户端分配IPv6地址: %s", clientIPv6.String())
+	} else {
+		log.Printf("服务器不支持IPv6，不分配IPv6地址")
+		clientIPv6 = nil
 	}
-	clientIPv6 := net.ParseIP(ipv6Prefix + ipv6Suffix)
 
 	// 添加客户端到WireGuard设备
 	err = wgDevice.AddPeer(clientConfig, clientIP)
@@ -1019,7 +1354,11 @@ func addSpecificClient(serverConfig *wireguard.Config, wgDevice *wireguard.WireG
 		return
 	}
 
-	log.Printf("已添加客户端, IPv4: %s, IPv6: %s, 公钥: %s", clientIP.String(), clientIPv6.String(), pubKey.String())
+	if ipv6Supported && clientIPv6 != nil {
+		log.Printf("已添加客户端, IPv4: %s, IPv6: %s, 公钥: %s", clientIP.String(), clientIPv6.String(), pubKey.String())
+	} else {
+		log.Printf("已添加客户端, IPv4: %s, 公钥: %s", clientIP.String(), pubKey.String())
+	}
 
 	// 更新配置文件
 	clientConfigs := []*wireguard.Config{clientConfig}
@@ -1402,10 +1741,11 @@ type RegistrationRequest struct {
 
 // 客户端注册响应结构
 type RegistrationResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-	IP      string `json:"ip,omitempty"`
-	IPv6    string `json:"ipv6,omitempty"` // 添加IPv6地址字段
+	Success       bool   `json:"success"`
+	Message       string `json:"message"`
+	IP            string `json:"ip,omitempty"`
+	IPv6          string `json:"ipv6,omitempty"` // IPv6地址字段
+	IPv6Supported bool   `json:"ipv6_supported"` // 服务器是否支持IPv6
 }
 
 // handleClientRegistration 处理客户端注册请求
@@ -1516,39 +1856,50 @@ func handleClientRegistration(conn *net.UDPConn, clientAddr *net.UDPAddr, data [
 		clientIP := allocateIP()
 
 		// 分配IPv6地址
-		ipv6Prefix := "fd86:ea04:1115::"
-		ipv4Parts := strings.Split(clientIP.String(), ".")
-		ipv6Suffix := ""
-
-		// 初始化clientIPv6变量
 		var clientIPv6 net.IP
 
-		// 验证IP地址格式
-		if len(ipv4Parts) != 4 {
-			log.Printf("警告: 无效的IPv4地址格式: %s, 使用默认IPv6地址", clientIP.String())
-			clientIPv6 = net.ParseIP("fd86:ea04:1115::1")
-			if clientIPv6 == nil {
-				log.Printf("错误: 无法解析默认IPv6地址")
-				clientIPv6 = net.ParseIP("::1") // 使用本地环回地址作为最后的备选
-			}
-		} else {
-			// 正常处理
-			for _, part := range ipv4Parts {
-				ipv6Suffix += fmt.Sprintf("%02x", atoi(part))
-			}
-			clientIPv6 = net.ParseIP(ipv6Prefix + ipv6Suffix)
-			if clientIPv6 == nil {
-				log.Printf("警告: 无法生成有效的IPv6地址: %s%s, 使用默认IPv6地址", ipv6Prefix, ipv6Suffix)
+		// 检查服务器是否支持IPv6
+		if ipv6Supported {
+			ipv6Prefix := "fd86:ea04:1115::"
+			ipv4Parts := strings.Split(clientIP.String(), ".")
+			ipv6Suffix := ""
+
+			// 验证IP地址格式
+			if len(ipv4Parts) != 4 {
+				log.Printf("警告: 无效的IPv4地址格式: %s, 使用默认IPv6地址", clientIP.String())
 				clientIPv6 = net.ParseIP("fd86:ea04:1115::1")
 				if clientIPv6 == nil {
 					log.Printf("错误: 无法解析默认IPv6地址")
 					clientIPv6 = net.ParseIP("::1") // 使用本地环回地址作为最后的备选
 				}
+			} else {
+				// 正常处理
+				for _, part := range ipv4Parts {
+					ipv6Suffix += fmt.Sprintf("%02x", atoi(part))
+				}
+				clientIPv6 = net.ParseIP(ipv6Prefix + ipv6Suffix)
+				if clientIPv6 == nil {
+					log.Printf("警告: 无法生成有效的IPv6地址: %s%s, 使用默认IPv6地址", ipv6Prefix, ipv6Suffix)
+					clientIPv6 = net.ParseIP("fd86:ea04:1115::1")
+					if clientIPv6 == nil {
+						log.Printf("错误: 无法解析默认IPv6地址")
+						clientIPv6 = net.ParseIP("::1") // 使用本地环回地址作为最后的备选
+					}
+				}
 			}
-		}
 
-		// 记录分配的IPv6地址
-		log.Printf("为客户端分配的IPv6地址: %s", clientIPv6.String())
+			// 获取服务器的公网IPv6地址
+			serverIPv6 := getServerIPv6()
+			if serverIPv6 != "" {
+				log.Printf("服务器公网IPv6地址: %s", serverIPv6)
+			}
+
+			// 记录分配的IPv6地址
+			log.Printf("为客户端分配的IPv6地址: %s", clientIPv6.String())
+		} else {
+			log.Printf("服务器不支持IPv6，不分配IPv6地址")
+			clientIPv6 = nil
+		}
 
 		// 创建允许的IP - 这里允许客户端发送和接收更多流量
 		allowedIPs := []net.IPNet{}
@@ -1557,9 +1908,12 @@ func handleClientRegistration(conn *net.UDPConn, clientAddr *net.UDPAddr, data [
 		_, ipNet, _ := net.ParseCIDR(fmt.Sprintf("%s/32", clientIP.String()))
 		allowedIPs = append(allowedIPs, *ipNet)
 
-		// 添加客户端特定IPv6
-		_, ipv6Net, _ := net.ParseCIDR(fmt.Sprintf("%s/128", clientIPv6.String()))
-		allowedIPs = append(allowedIPs, *ipv6Net)
+		// 添加客户端特定IPv6（如果服务器支持IPv6）
+		if ipv6Supported && clientIPv6 != nil {
+			_, ipv6Net, _ := net.ParseCIDR(fmt.Sprintf("%s/128", clientIPv6.String()))
+			allowedIPs = append(allowedIPs, *ipv6Net)
+			log.Printf("已添加客户端特定IPv6地址到AllowedIPs")
+		}
 
 		// 添加VPN网段，允许与其他客户端通信
 		_, vpnNet, _ := net.ParseCIDR("10.8.0.0/24")
@@ -1580,17 +1934,24 @@ func handleClientRegistration(conn *net.UDPConn, clientAddr *net.UDPAddr, data [
 		_, linkLocalNet, _ := net.ParseCIDR("169.254.0.0/16")
 		allowedIPs = append(allowedIPs, *linkLocalNet)
 
-		// 添加IPv6 VPN网段
-		_, ipv6VpnNet, _ := net.ParseCIDR("fd86:ea04:1115::/64")
-		allowedIPs = append(allowedIPs, *ipv6VpnNet)
+		// 添加IPv6相关网段（如果服务器支持IPv6）
+		if ipv6Supported {
+			// 添加IPv6 VPN网段
+			_, ipv6VpnNet, _ := net.ParseCIDR("fd86:ea04:1115::/64")
+			allowedIPs = append(allowedIPs, *ipv6VpnNet)
 
-		// 添加IPv6链路本地地址范围
-		_, ipv6LinkLocalNet, _ := net.ParseCIDR("fe80::/10")
-		allowedIPs = append(allowedIPs, *ipv6LinkLocalNet)
+			// 添加IPv6链路本地地址范围
+			_, ipv6LinkLocalNet, _ := net.ParseCIDR("fe80::/10")
+			allowedIPs = append(allowedIPs, *ipv6LinkLocalNet)
 
-		// 添加IPv6本地回环地址
-		_, ipv6LoopbackNet, _ := net.ParseCIDR("::1/128")
-		allowedIPs = append(allowedIPs, *ipv6LoopbackNet)
+			// 添加IPv6本地回环地址
+			_, ipv6LoopbackNet, _ := net.ParseCIDR("::1/128")
+			allowedIPs = append(allowedIPs, *ipv6LoopbackNet)
+
+			log.Printf("已添加IPv6相关网段到AllowedIPs")
+		} else {
+			log.Printf("服务器不支持IPv6，跳过添加IPv6相关网段")
+		}
 
 		// 注意：我们不添加全局范围(0.0.0.0/0和::/0)，以避免可能的安全问题
 		// 上面添加的范围应该足以解决大多数“IPv4 packet with disallowed source address”错误
@@ -1644,9 +2005,10 @@ func handleClientRegistration(conn *net.UDPConn, clientAddr *net.UDPAddr, data [
 // sendRegistrationResponse 发送注册响应
 func sendRegistrationResponse(conn *net.UDPConn, clientAddr *net.UDPAddr, success bool, message string, ip string, ipv6 ...string) {
 	response := RegistrationResponse{
-		Success: success,
-		Message: message,
-		IP:      ip,
+		Success:       success,
+		Message:       message,
+		IP:            ip,
+		IPv6Supported: ipv6Supported, // 添加服务器IPv6支持状态
 	}
 
 	// 如果提供了IPv6地址，添加到响应中
