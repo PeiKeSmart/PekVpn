@@ -350,6 +350,29 @@ func main() {
 	go startHeartbeatService(config.Endpoint, clientPubKey, config, heartbeatStopCh)
 	log.Printf("心跳服务已启动，将定期向服务器发送心跳")
 
+	// 启动WiFi连接监控
+	wifiMonitor := NewWiFiMonitor()
+	wifiMonitor.SetDisconnectHandler(func() {
+		log.Printf("WiFi断开连接，正在等待重新连接...")
+	})
+	wifiMonitor.SetReconnectHandler(func(oldSSID, newSSID string) {
+		log.Printf("WiFi重新连接: %s -> %s，正在检查VPN连接状态...", oldSSID, newSSID)
+		// 检查VPN连接状态，如果需要则重新连接
+		if !checkConnectionStatus(wgDevice) {
+			log.Printf("WiFi重连后VPN连接已断开，尝试重新连接...")
+			err := reinitializeConnection(wgDevice, config)
+			if err != nil {
+				log.Printf("WiFi重连后VPN重连失败: %v", err)
+			} else {
+				log.Printf("WiFi重连后VPN重连成功")
+			}
+		} else {
+			log.Printf("WiFi重连后VPN连接正常")
+		}
+	})
+	wifiMonitor.Start()
+	defer wifiMonitor.Stop()
+
 	// 启动连接监控和自动重连
 	go startConnectionMonitor(wgDevice, config)
 
@@ -3175,7 +3198,40 @@ func restartNetworkAdapters() bool {
 // restartSingleAdapter 重启单个网络适配器
 func restartSingleAdapter(adapter string) {
 	log.Printf("正在重启网络适配器: %s", adapter)
-	cmd := fmt.Sprintf("Restart-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
+
+	// 首先尝试使用更温和的方式重启网络连接
+	log.Printf("尝试使用温和方式刷新网络连接...")
+
+	// 1. 先尝试刷新IP配置而不是直接重启适配器
+	cmd := "ipconfig /renew"
+	_, _ = runCommand(cmd)
+	time.Sleep(2 * time.Second)
+
+	// 检查网络是否已恢复
+	if isNetworkConnected() {
+		log.Printf("刷新IP配置后网络已恢复，无需重启适配器")
+		return
+	}
+
+	// 2. 如果刷新IP配置失败，尝试使用netsh命令重置网络接口
+	log.Printf("刷新IP配置未能恢复网络，尝试重置网络接口...")
+	cmd = fmt.Sprintf("netsh interface set interface \"%s\" disable", adapter)
+	_, _ = runCommand(cmd)
+	time.Sleep(1 * time.Second)
+
+	cmd = fmt.Sprintf("netsh interface set interface \"%s\" enable", adapter)
+	_, _ = runCommand(cmd)
+	time.Sleep(3 * time.Second)
+
+	// 检查网络是否已恢复
+	if isNetworkConnected() {
+		log.Printf("使用netsh重置网络接口后网络已恢复")
+		return
+	}
+
+	// 3. 如果上述方法都失败，才使用PowerShell命令重启适配器
+	log.Printf("温和方式未能恢复网络，尝试使用PowerShell重启适配器...")
+	cmd = fmt.Sprintf("Restart-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
 	restartOutput, restartErr := runCommand(cmd)
 	if restartErr != nil {
 		log.Printf("重启网络适配器失败: %s, 错误: %v, 输出: %s", adapter, restartErr, truncateOutput(restartOutput, 5))
@@ -3192,6 +3248,9 @@ func restartSingleAdapter(adapter string) {
 	} else {
 		log.Printf("已重启网络适配器: %s", adapter)
 	}
+
+	// 等待适配器重启完成
+	time.Sleep(3 * time.Second)
 }
 
 // getDefaultNetworkAdapter 获取默认网络适配器
@@ -3474,6 +3533,13 @@ func startConnectionMonitor(wgDevice *wireguard.WireGuardDevice, config *wiregua
 	consecutiveFailures := 0           // 连续检测失败次数
 	maxConsecutiveFailures := 3        // 触发重连的连续失败次数
 
+	// 添加网络状态监控
+	lastNetworkStatus := true // 假设初始网络状态正常
+	networkStatusCheckTime := time.Now()
+
+	// 添加WiFi信号强度监控
+	var lastWiFiSignal int = -1
+
 	for {
 		// 检查是否在稳定期内
 		inStabilityPeriod := !lastReconnectTime.IsZero() && time.Since(lastReconnectTime) < stabilityPeriod
@@ -3484,6 +3550,30 @@ func startConnectionMonitor(wgDevice *wireguard.WireGuardDevice, config *wiregua
 				(stabilityPeriod - time.Since(lastReconnectTime)).Round(time.Second))
 			time.Sleep(30 * time.Second)
 			continue
+		}
+
+		// 每隔一段时间检查WiFi信号强度
+		if time.Since(networkStatusCheckTime) > 2*time.Minute {
+			// 检查WiFi信号强度
+			wifiMonitor := NewWiFiMonitor()
+			signal, err := wifiMonitor.GetWiFiSignalStrength()
+			if err == nil {
+				if lastWiFiSignal != -1 && lastWiFiSignal > 60 && signal < 30 {
+					// WiFi信号强度显著下降，可能导致连接不稳定
+					log.Printf("WiFi信号强度显著下降: %d%% -> %d%%，可能导致连接不稳定", lastWiFiSignal, signal)
+				}
+				lastWiFiSignal = signal
+			}
+
+			// 检查整体网络状态
+			currentNetworkStatus := isNetworkConnected()
+			if lastNetworkStatus && !currentNetworkStatus {
+				log.Printf("检测到网络状态变化: 正常 -> 异常，可能影响VPN连接")
+			} else if !lastNetworkStatus && currentNetworkStatus {
+				log.Printf("检测到网络状态变化: 异常 -> 正常，VPN连接可能恢复")
+			}
+			lastNetworkStatus = currentNetworkStatus
+			networkStatusCheckTime = time.Now()
 		}
 
 		// 检查连接状态
@@ -3508,6 +3598,14 @@ func startConnectionMonitor(wgDevice *wireguard.WireGuardDevice, config *wiregua
 				continue
 			}
 
+			// 检查物理网络连接状态
+			if !isNetworkConnected() {
+				log.Printf("物理网络连接异常，等待网络恢复后再尝试重连VPN")
+				// 等待一段时间再检查
+				time.Sleep(30 * time.Second)
+				continue
+			}
+
 			consecutiveFailures++
 			log.Printf("检测到可能断开，这是第 %d/%d 次连续检测失败",
 				consecutiveFailures, maxConsecutiveFailures)
@@ -3515,6 +3613,10 @@ func startConnectionMonitor(wgDevice *wireguard.WireGuardDevice, config *wiregua
 			// 只有连续多次检测失败才触发重连
 			if consecutiveFailures >= maxConsecutiveFailures {
 				log.Printf("检测到连接断开，尝试重新连接...")
+
+				// 先尝试修复网络连接
+				log.Printf("尝试修复基础网络连接...")
+				fixNetworkBeforeReconnect()
 
 				// 如果上次重连尝试在一分钟内，增加重连延迟
 				if !lastReconnectTime.IsZero() && time.Since(lastReconnectTime) < time.Minute {
@@ -3570,6 +3672,29 @@ func startConnectionMonitor(wgDevice *wireguard.WireGuardDevice, config *wiregua
 			// 连接正常时，使用较长的检查间隔
 			time.Sleep(60 * time.Second)
 		}
+	}
+}
+
+// fixNetworkBeforeReconnect 在重连前修复网络连接
+func fixNetworkBeforeReconnect() {
+	// 1. 刷新DNS缓存
+	log.Printf("刷新DNS缓存...")
+	flushDNSCache()
+
+	// 2. 刷新IP配置
+	log.Printf("刷新IP配置...")
+	cmd := "ipconfig /renew"
+	_, _ = runCommand(cmd)
+
+	// 3. 等待网络恢复
+	log.Printf("等待网络恢复...")
+	time.Sleep(3 * time.Second)
+
+	// 4. 检查网络是否已恢复
+	if isNetworkConnected() {
+		log.Printf("基础网络连接已恢复")
+	} else {
+		log.Printf("基础网络连接仍然异常，继续尝试重连VPN")
 	}
 }
 
@@ -4134,20 +4259,46 @@ func reinitializeConnection(wgDevice *wireguard.WireGuardDevice, config *wiregua
 	// 记录重连开始时间
 	startTime := time.Now()
 
+	// 先检查网络连接状态
+	if !isNetworkConnected() {
+		log.Printf("网络连接异常，尝试修复基础网络连接...")
+		fixNetworkBeforeReconnect()
+
+		// 再次检查网络连接
+		if !isNetworkConnected() {
+			log.Printf("基础网络连接仍然异常，继续尝试重连VPN，但可能会失败")
+		} else {
+			log.Printf("基础网络连接已恢复，继续重连VPN")
+		}
+	}
+
+	// 清理可能存在的冲突资源
+	log.Printf("清理可能存在的冲突资源...")
+	cleanupForReconnect()
+
 	// 关闭当前设备
+	log.Printf("关闭当前WireGuard设备...")
 	wgDevice.Close()
 
-	// 等待一段时间
-	time.Sleep(1 * time.Second)
+	// 等待一段时间，确保资源释放
+	time.Sleep(2 * time.Second)
 
 	// 探测最佳MTU值
 	optimalMTU := detectOptimalMTU()
 	log.Printf("重连时使用MTU值: %d", optimalMTU)
 
 	// 重新创建设备
+	log.Printf("创建新的WireGuard设备...")
 	newDevice, err := wireguard.NewWireGuardDevice(config, false, optimalMTU)
 	if err != nil {
-		return fmt.Errorf("重新创建 WireGuard 设备失败: %v", err)
+		log.Printf("重新创建WireGuard设备失败: %v，尝试再次创建...", err)
+
+		// 如果失败，等待更长时间再次尝试
+		time.Sleep(3 * time.Second)
+		newDevice, err = wireguard.NewWireGuardDevice(config, false, optimalMTU)
+		if err != nil {
+			return fmt.Errorf("重新创建WireGuard设备失败(第二次尝试): %v", err)
+		}
 	}
 
 	// 解析IP地址和子网掩码
@@ -4158,42 +4309,117 @@ func reinitializeConnection(wgDevice *wireguard.WireGuardDevice, config *wiregua
 	}
 
 	// 配置TUN设备IP地址
+	log.Printf("配置TUN设备IP地址: %s", *clientIP)
 	err = configureTunIP(newDevice.TunName, ip, ipNet)
 	if err != nil {
-		newDevice.Close()
-		return fmt.Errorf("配置TUN设备IP地址失败: %v", err)
+		log.Printf("配置TUN设备IP地址失败: %v，尝试再次配置...", err)
+
+		// 如果失败，等待一段时间再次尝试
+		time.Sleep(2 * time.Second)
+		err = configureTunIP(newDevice.TunName, ip, ipNet)
+		if err != nil {
+			newDevice.Close()
+			return fmt.Errorf("配置TUN设备IP地址失败(第二次尝试): %v", err)
+		}
 	}
 
 	// 更新设备引用
 	*wgDevice = *newDevice
 
+	// 配置DNS
+	log.Printf("配置DNS...")
+	err = configureDNS(newDevice.TunName)
+	if err != nil {
+		log.Printf("配置DNS失败: %v，但继续重连过程", err)
+	}
+
 	// 重新配置路由
-	if *fullTunnel {
-		// 添加服务器特殊路由
-		addServerRoute(config.Endpoint)
+	log.Printf("重新配置路由...")
 
-		// 添加VPN网段路由
-		for _, allowedIP := range config.AllowedIPs {
-			addRoute(allowedIP.String(), newDevice.TunName)
+	// 先添加服务器特殊路由，确保与服务器的通信不通过VPN
+	log.Printf("添加服务器特殊路由...")
+	addServerRoute(config.Endpoint)
+
+	// 等待一下，确保服务器特殊路由生效
+	time.Sleep(500 * time.Millisecond)
+
+	// 添加VPN网段路由
+	log.Printf("添加VPN网段路由...")
+	for _, allowedIP := range config.AllowedIPs {
+		err := addRoute(allowedIP.String(), newDevice.TunName)
+		if err != nil {
+			log.Printf("添加VPN网段路由失败: %s, %v，但继续重连过程", allowedIP.String(), err)
 		}
+	}
 
-		// 添加默认路由
+	// 如果是全局模式，添加默认路由
+	if *fullTunnel {
+		log.Printf("添加默认路由(全局模式)...")
 		_, defaultNet, _ := net.ParseCIDR("0.0.0.0/0")
-		addRoute(defaultNet.String(), newDevice.TunName)
+		err := addRoute(defaultNet.String(), newDevice.TunName)
+		if err != nil {
+			log.Printf("添加默认路由失败: %v，但继续重连过程", err)
+		}
 		log.Printf("已重新配置全局路由")
 	} else {
-		// 添加服务器特殊路由
-		addServerRoute(config.Endpoint)
-
-		// 添加VPN网段路由
-		for _, allowedIP := range config.AllowedIPs {
-			addRoute(allowedIP.String(), newDevice.TunName)
-		}
 		log.Printf("已重新配置分流路由")
+	}
+
+	// 验证连接
+	log.Printf("验证VPN连接...")
+	time.Sleep(2 * time.Second) // 等待连接建立
+
+	if checkConnectionStatus(wgDevice) {
+		log.Printf("VPN连接验证成功")
+	} else {
+		log.Printf("VPN连接验证失败，但继续重连过程")
 	}
 
 	// 记录重连完成时间
 	log.Printf("重连完成，耗时: %s", time.Since(startTime).Round(time.Millisecond))
 
 	return nil
+}
+
+// cleanupForReconnect 在重连前清理可能存在的冲突资源
+func cleanupForReconnect() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	// 1. 清理可能存在的冲突路由
+	log.Printf("清理可能存在的冲突路由...")
+
+	// 清理VPN网段路由
+	_, vpnNet, _ := net.ParseCIDR("10.8.0.0/24")
+	if vpnNet != nil {
+		deleteRoute(vpnNet.String())
+	}
+
+	_, vpnNet2, _ := net.ParseCIDR("10.9.0.0/24")
+	if vpnNet2 != nil {
+		deleteRoute(vpnNet2.String())
+	}
+
+	// 2. 检查并清理孤立的WireGuard适配器
+	log.Printf("检查并清理孤立的WireGuard适配器...")
+	cmd := "Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*WireGuard*' -and $_.Status -ne 'Up'} | Select-Object -ExpandProperty Name"
+	output, _ := runCommand(cmd)
+	adapters := strings.Split(strings.TrimSpace(output), "\n")
+
+	for _, adapter := range adapters {
+		adapter = strings.TrimSpace(adapter)
+		if adapter != "" {
+			log.Printf("发现孤立的WireGuard适配器: %s，尝试重新启用", adapter)
+			cmd = fmt.Sprintf("Enable-NetAdapter -Name \"%s\" -Confirm:$false", adapter)
+			_, _ = runCommand(cmd)
+		}
+	}
+
+	// 3. 刷新DNS缓存
+	log.Printf("刷新DNS缓存...")
+	flushDNSCache()
+
+	// 4. 等待清理完成
+	time.Sleep(1 * time.Second)
 }
