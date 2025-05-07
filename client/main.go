@@ -2985,6 +2985,112 @@ func testInternetConnection() {
 	} else {
 		log.Printf("服务器在中国大陆，跳过Google网站测试")
 	}
+
+	// 在Windows系统上修复NCSI网络连接状态指示器
+	if runtime.GOOS == "windows" {
+		log.Printf("正在修复Windows网络连接状态指示器(NCSI)...")
+		fixNCSINetworkStatus()
+	}
+}
+
+// fixNCSINetworkStatus 修复Windows网络连接状态指示器(NCSI)
+func fixNCSINetworkStatus() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	log.Printf("开始修复Windows网络连接状态指示器(NCSI)...")
+
+	// 方法1: 确保EnableActiveProbing注册表项设置为1
+	cmd := `Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet" -Name "EnableActiveProbing" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty EnableActiveProbing`
+	output, err := runCommand(cmd)
+	if err != nil || strings.TrimSpace(output) != "1" {
+		log.Printf("NCSI主动探测未启用，正在启用...")
+		cmd = `Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet" -Name "EnableActiveProbing" -Value 1 -Type DWord -Force`
+		_, err = runCommand(cmd)
+		if err != nil {
+			log.Printf("启用NCSI主动探测失败: %v", err)
+		} else {
+			log.Printf("已成功启用NCSI主动探测")
+		}
+	} else {
+		log.Printf("NCSI主动探测已启用")
+	}
+
+	// 方法2: 触发NCSI重新检测网络连接状态
+	log.Printf("正在触发NCSI重新检测网络连接状态...")
+
+	// 2.1 先尝试访问NCSI测试网站，确保可以访问
+	cmd = "Invoke-WebRequest -Uri 'http://www.msftconnecttest.com/connecttest.txt' -UseBasicParsing -TimeoutSec 5 -ErrorAction SilentlyContinue"
+	output, err = runCommand(cmd)
+	if err != nil {
+		log.Printf("无法访问NCSI测试网站: %v", err)
+		// 尝试使用curl
+		cmd = "curl -s -o nul -w \"%{http_code}\" --connect-timeout 5 http://www.msftconnecttest.com/connecttest.txt"
+		output, err = runCommand(cmd)
+		if err != nil || !strings.Contains(output, "200") {
+			log.Printf("使用curl访问NCSI测试网站失败: %v, 输出: %s", err, output)
+		} else {
+			log.Printf("使用curl成功访问NCSI测试网站")
+		}
+	} else {
+		log.Printf("成功访问NCSI测试网站")
+	}
+
+	// 2.2 重启NLA服务以触发NCSI重新检测
+	log.Printf("正在重启网络位置感知(NLA)服务...")
+	cmd = "Restart-Service -Name NlaSvc -Force -ErrorAction SilentlyContinue"
+	_, err = runCommand(cmd)
+	if err != nil {
+		log.Printf("重启NLA服务失败: %v", err)
+		// 尝试使用net命令
+		cmd = "net stop NlaSvc && net start NlaSvc"
+		_, err = runCommand(cmd)
+		if err != nil {
+			log.Printf("使用net命令重启NLA服务失败: %v", err)
+		} else {
+			log.Printf("使用net命令成功重启NLA服务")
+		}
+	} else {
+		log.Printf("成功重启NLA服务")
+	}
+
+	// 2.3 等待服务重启完成
+	time.Sleep(2 * time.Second)
+
+	// 2.4 检查网络连接状态
+	cmd = "Get-NetConnectionProfile | Select-Object -ExpandProperty IPv4Connectivity"
+	output, err = runCommand(cmd)
+	if err != nil {
+		log.Printf("获取网络连接状态失败: %v", err)
+	} else {
+		if strings.Contains(output, "Internet") {
+			log.Printf("网络连接状态已修复，显示为'Internet'")
+		} else {
+			log.Printf("网络连接状态仍然异常: %s", strings.TrimSpace(output))
+
+			// 2.5 如果仍然异常，尝试刷新网络设置
+			log.Printf("尝试刷新网络设置...")
+			cmd = "ipconfig /renew"
+			_, _ = runCommand(cmd)
+			time.Sleep(1 * time.Second)
+
+			cmd = "ipconfig /flushdns"
+			_, _ = runCommand(cmd)
+			time.Sleep(1 * time.Second)
+
+			// 再次检查网络连接状态
+			cmd = "Get-NetConnectionProfile | Select-Object -ExpandProperty IPv4Connectivity"
+			output, err = runCommand(cmd)
+			if err == nil && strings.Contains(output, "Internet") {
+				log.Printf("刷新网络设置后，网络连接状态已修复")
+			} else {
+				log.Printf("刷新网络设置后，网络连接状态仍然异常")
+			}
+		}
+	}
+
+	log.Printf("Windows网络连接状态指示器(NCSI)修复完成")
 }
 
 // isNetworkConnected 检查网络连接状态
@@ -4371,6 +4477,12 @@ func reinitializeConnection(wgDevice *wireguard.WireGuardDevice, config *wiregua
 
 	if checkConnectionStatus(wgDevice) {
 		log.Printf("VPN连接验证成功")
+
+		// 在Windows系统上修复NCSI网络连接状态指示器
+		if runtime.GOOS == "windows" {
+			log.Printf("VPN连接成功后修复Windows网络连接状态指示器(NCSI)...")
+			fixNCSINetworkStatus()
+		}
 	} else {
 		log.Printf("VPN连接验证失败，但继续重连过程")
 	}
