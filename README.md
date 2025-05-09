@@ -27,6 +27,7 @@
 - [x] 支持 IPv6 禁用功能，防止 IPv6 地址泄露
 - [x] 实现心跳机制，确保连接状态准确监控
 - [x] 优化网络切换，减少连接和断开时的网络波动
+- [x] 修复Windows NCSI网络连接状态指示器，确保VPN连接后系统托盘显示正确的网络状态
 
 ## 系统要求
 
@@ -308,6 +309,16 @@ copy "C:\Program Files\WireGuard\wintun.dll" .
 - 如果仍然出现明显的网络波动，可能是由于系统需要重新配置网络路由
 - 尝试降低 VPN 接口的优先级，可以减少切换时的影响
 
+### Windows系统显示"Internet无法上网"
+
+- 这是由于Windows网络连接状态指示器(NCSI)的工作方式导致的
+- 最新版本已经实现了自动修复功能，在VPN连接建立后会自动修复NCSI状态
+- 修复过程包括：
+  1. 确保EnableActiveProbing注册表项设置为1，启用NCSI主动探测
+  2. 触发NCSI重新检测网络连接状态
+  3. 重启网络位置感知(NLA)服务
+- 如果仍然显示"Internet无法上网"，但实际上可以正常访问网站，这只是一个显示问题，不影响实际使用
+
 ### 客户端超时清理
 
 - 服务器会自动清理长时间未响应的客户端
@@ -443,6 +454,26 @@ pekserver.exe -client-timeout=30 -auto-cleanup=true
 2. 通过不同的命令（REGISTER_CLIENT、HEARTBEAT、DISCONNECT）来区分不同的操作
 3. 现在只需要开放 2 个端口：WireGuard 端口和注册/心跳/断开连接通知端口
 
+### Windows NCSI网络连接状态指示器修复
+
+最新版本实现了Windows NCSI（网络连接状态指示器）自动修复功能，解决了VPN连接后系统托盘错误显示"Internet无法上网"的问题：
+
+1. **自动修复时机**：
+   - VPN初始连接成功后自动执行
+   - VPN重新连接成功后自动执行
+   - 网络测试过程中自动执行
+
+2. **修复方法**：
+   - 确保EnableActiveProbing注册表项设置为1，启用NCSI主动探测
+   - 主动访问Microsoft NCSI测试网站，确保可以访问
+   - 重启网络位置感知(NLA)服务，触发NCSI重新检测
+   - 如果仍然异常，尝试刷新网络设置（ipconfig /renew和ipconfig /flushdns）
+
+3. **用户体验改进**：
+   - 不再出现"Internet无法上网"的错误提示
+   - 系统托盘网络图标显示正确的连接状态
+   - 无需用户手动修改系统设置或重启网络服务
+
 ## 性能优化建议
 
 1. **MTU 优化**：如果遇到网络性能问题，可以尝试手动调整 MTU 值，例如 `-mtu=1380`
@@ -467,6 +498,7 @@ pekserver.exe -client-timeout=30 -auto-cleanup=true
 - [x] 心跳机制，确保连接状态准确监控
 - [x] 网络切换优化，减少连接和断开时的波动
 - [x] 端口共享功能，减少需要开放的端口数量
+- [x] Windows NCSI网络连接状态指示器修复，解决"Internet无法上网"错误提示问题
 
 ### 计划中功能
 
