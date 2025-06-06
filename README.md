@@ -98,234 +98,296 @@ pause
 
 ## 使用方法
 
+### 获取预编译版本
+
+如果您不想自己编译，可以直接使用项目中提供的预编译版本：
+
+- `pekserver.exe` - Windows 服务器端可执行文件
+- `pekclient.exe` - Windows 客户端可执行文件
+- `pekclient.zip` - 客户端打包版本，包含所有必要文件
+
 ### 编译可执行文件
 
-可以将服务器和客户端编译为可执行文件，方便分发和使用：
+#### 基本编译
 
 ```bash
-# 编译服务器
-# Linux/macOS
-cd server
-go build -o pekserver main.go
-
-# Windows
-cd server
-go build -o pekserver.exe main.go
+# 编译服务器端
+go build -o pekserver ./server
 
 # 编译客户端
-# Linux/macOS
-cd client
-go build -o pekclient main.go
+go build -o pekclient ./client
 
-# Windows
-cd client
-go build -o pekclient.exe main.go
+# Windows 平台编译（添加 .exe 后缀）
+go build -o pekserver.exe ./server
+go build -o pekclient.exe ./client
 ```
 
-### 服务器端
-
-服务器需要以管理员/root 权限运行：
+#### 跨平台编译
 
 ```bash
-# Linux/macOS
-cd server
-sudo go run main.go -port 23456 -enable-reg
-# 或者使用编译后的可执行文件
-sudo ./pekserver -port 23456 -enable-reg
+# 为 Windows 64位 编译
+GOOS=windows GOARCH=amd64 go build -o pekserver.exe ./server
+GOOS=windows GOARCH=amd64 go build -o pekclient.exe ./client
 
-# Windows (管理员权限)
-cd server
-go run main.go -port 23456 -enable-reg
-# 或者使用编译后的可执行文件
-pekserver.exe -port 23456 -enable-reg
+# 为 Linux 64位 编译
+GOOS=linux GOARCH=amd64 go build -o pekserver ./server
+GOOS=linux GOARCH=amd64 go build -o pekclient ./client
+
+# 为 macOS 64位 编译
+GOOS=darwin GOARCH=amd64 go build -o pekserver ./server
+GOOS=darwin GOARCH=amd64 go build -o pekclient ./client
+
+# 为 ARM64 架构编译（适用于 Apple M1/M2 Mac 和 ARM Linux）
+GOOS=darwin GOARCH=arm64 go build -o pekserver ./server
+GOOS=linux GOARCH=arm64 go build -o pekserver ./server
 ```
 
-服务器端参数说明：
-
-- `-port <端口>`: 指定 WireGuard 监听端口，默认为 23456
-- `-ip <IP地址>`: 指定 TUN 设备 IP 地址，默认为 10.8.0.1/24
-- `-tun <设备名>`: 指定 TUN 设备名称，默认为 wg0
-- `-config <文件路径>`: 指定配置文件路径，默认为 wg-server.conf
-- `-enable-reg`: 启用客户端自动注册，默认为 true
-- `-reg-secret <密钥>`: 指定客户端注册密钥，默认为 vpnsecret
-- `-client-pubkey <公钥>`: 指定特定客户端公钥（当禁用自动注册时）
-- `-client-timeout <分钟>`: 客户端超时时间，超过此时间未响应的客户端将被自动清理，默认为 10 分钟
-- `-auto-cleanup`: 是否自动清理超时的客户端，默认为 true
-- `-amnezia`: 启用 AmneziaWG 特殊修改
-
-### 客户端
-
-客户端需要以管理员/root 权限运行：
+#### 优化编译（减小文件大小）
 
 ```bash
-# Linux/macOS
-cd client
-sudo go run main.go -server <服务器地址:端口>
-# 或者使用编译后的可执行文件
-sudo ./pekclient -server <服务器地址:端口>
+# 使用编译优化，减小可执行文件大小
+go build -ldflags="-s -w" -o pekserver ./server
+go build -ldflags="-s -w" -o pekclient ./client
 
-# Windows (管理员权限)
-cd client
-go run main.go -server <服务器地址:端口>
-# 或者使用编译后的可执行文件
-pekclient.exe -server <服务器地址:端口>
+# Windows 平台隐藏控制台窗口（仅适用于有GUI的应用）
+go build -ldflags="-s -w -H=windowsgui" -o pekclient.exe ./client
 ```
 
-客户端参数说明：
+#### 批量编译脚本
 
-- `-server <地址:端口>`: 指定服务器地址和端口，默认为 172.16.8.10:23456
-- `-ip <IP地址>`: 指定客户端 IP 地址，默认为 10.9.0.2/24
-- `-tun <设备名>`: 指定 TUN 设备名称，默认为 wgc0
-- `-listen-port <端口>`: 指定客户端监听端口，默认为 51821
-- `-private-key <私钥>`: 指定客户端私钥（可选）
-- `-server-pubkey <公钥>`: 指定服务器公钥（可选）
-- `-reg-secret <密钥>`: 指定注册密钥，默认为 vpnsecret
-- `-client-name <名称>`: 指定客户端名称
-- `-config <文件路径>`: 指定配置文件路径（可选）
-- `-full-tunnel`: 启用全局代理模式，默认为 true
-- `-protect-webrtc`: 启用 WebRTC 泄露防护，防止真实 IP 地址泄露
-- `-webrtc-mode`: WebRTC 保护模式，支持 spoof(模拟)和 block(阻止)，默认为 spoof
-- `-dns-proxy`: 启用 DNS 代理，防止 DNS 泄露
-- `-dns`: 指定 DNS 服务器，默认为 8.8.8.8,114.114.114.114
-- `-diagnose`: 启用诊断模式，判断网络问题
-- `-amnezia`: 启用 AmneziaWG 特殊修改
+创建 `build.sh`（Linux/macOS）或 `build.bat`（Windows）来批量编译：
 
-## 常见问题
+**build.sh**：
+```bash
+#!/bin/bash
+echo "开始编译 PekHight VPN..."
 
-### Windows 10/11 没有 Routing and Remote Access 服务
+# 创建输出目录
+mkdir -p builds/{windows,linux,darwin}
 
-Windows 10 和 Windows 11 家庭版没有内置的 Routing and Remote Access 服务（RRAS），这会导致 VPN 服务器启动失败。解决方案：
+# 编译 Windows 版本
+echo "编译 Windows 版本..."
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o builds/windows/pekserver.exe ./server
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o builds/windows/pekclient.exe ./client
 
-1. **使用不依赖 RRAS 的启动脚本**：
+# 编译 Linux 版本
+echo "编译 Linux 版本..."
+GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o builds/linux/pekserver ./server
+GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o builds/linux/pekclient ./client
 
-   我们提供了一个专为 Windows 家庭版设计的启动脚本 `start_server_windows_home.bat`，它包含以下功能：
-   - 启用 IP 转发
-   - 配置防火墙规则
-   - 启动 VPN 服务器
-   - 配置 Internet 连接共享
+# 编译 macOS 版本
+echo "编译 macOS 版本..."
+GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o builds/darwin/pekserver ./server
+GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o builds/darwin/pekclient ./client
 
-   使用方法：右键点击脚本，选择“以管理员身份运行”
+echo "编译完成！文件位于 builds/ 目录"
+```
 
-2. **使用第三方 NAT 工具**：如 ForwardIP 或 WinNAT
+**build.bat**：
+```batch
+@echo off
+echo 开始编译 PekHight VPN...
 
-3. **在虚拟机中运行 Linux 服务器**：在 VirtualBox 或 VMware 中运行 Linux 版本的服务器
+:: 创建输出目录
+if not exist builds\windows mkdir builds\windows
+if not exist builds\linux mkdir builds\linux
+if not exist builds\darwin mkdir builds\darwin
 
-### 创建 TUN 设备失败
+:: 编译 Windows 版本
+echo 编译 Windows 版本...
+set GOOS=windows
+set GOARCH=amd64
+go build -ldflags="-s -w" -o builds\windows\pekserver.exe .\server
+go build -ldflags="-s -w" -o builds\windows\pekclient.exe .\client
 
-- 确保以管理员/root 权限运行程序
-- Windows 平台确保 wintun.dll 位于程序目录或系统路径中
-- 检查是否已安装 WireGuard 驱动
+:: 编译 Linux 版本
+echo 编译 Linux 版本...
+set GOOS=linux
+set GOARCH=amd64
+go build -ldflags="-s -w" -o builds\linux\pekserver .\server
+go build -ldflags="-s -w" -o builds\linux\pekclient .\client
+
+:: 编译 macOS 版本
+echo 编译 macOS 版本...
+set GOOS=darwin
+set GOARCH=amd64
+go build -ldflags="-s -w" -o builds\darwin\pekserver .\server
+go build -ldflags="-s -w" -o builds\darwin\pekclient .\client
+
+echo 编译完成！文件位于 builds\ 目录
+pause
+```
+
+### 打包分发
+
+#### Windows 打包
 
 ```bash
-# Windows
-# 将 wintun.dll 复制到程序目录
-copy "C:\Program Files\WireGuard\wintun.dll" .
+# 创建 Windows 客户端完整包
+mkdir pekclient-windows
+cp pekclient.exe pekclient-windows/
+cp wintun.dll pekclient-windows/
+cp run_pekclient.bat pekclient-windows/
+
+# 创建启动脚本
+echo '@echo off
+echo 正在启动 PekHight VPN 客户端...
+echo 请确保以管理员权限运行此脚本
+pekclient.exe -server YOUR_SERVER_IP:23456
+pause' > pekclient-windows/start_client.bat
+
+# 压缩打包
+7z a pekclient-windows.zip pekclient-windows/
 ```
 
-### 无法连接到服务器
+#### Linux 打包
 
-- 检查服务器是否启动并监听正确的端口
-- 检查防火墙是否允许 WireGuard 端口的 UDP 流量
-- 使用 `-server-pubkey` 参数手动指定服务器公钥
+```bash
+# 创建 Linux 客户端包
+mkdir pekclient-linux
+cp pekclient pekclient-linux/
+chmod +x pekclient-linux/pekclient
 
-### 获取和使用服务器公钥
+# 创建启动脚本
+echo '#!/bin/bash
+echo "正在启动 PekHight VPN 客户端..."
+echo "请确保以 root 权限运行此脚本"
+if [ "$EUID" -ne 0 ]; then
+    echo "请使用 sudo 运行此脚本"
+    exit 1
+fi
+./pekclient -server YOUR_SERVER_IP:23456' > pekclient-linux/start_client.sh
+chmod +x pekclient-linux/start_client.sh
 
-当需要手动指定服务器公钥时，可以按照以下步骤操作：
+# 创建安装脚本
+echo '#!/bin/bash
+echo "安装 PekHight VPN 客户端..."
+sudo cp pekclient /usr/local/bin/
+echo "安装完成！使用 sudo pekclient 启动"' > pekclient-linux/install.sh
+chmod +x pekclient-linux/install.sh
 
-1. **获取服务器公钥**：
-   - 从服务器启动日志中获取，日志中会显示“服务器公钥: XXX=”
+# 压缩打包
+tar -czf pekclient-linux.tar.gz pekclient-linux/
+```
 
-   ```text
-   WireGuard服务器已启动
-   服务器: 0.0.0.0:23456
-   服务器公钥: AbCdEfGhIjKlMnOpQrStUvWxYz1234567890AbCd=
-   ```
+#### Docker 打包
 
-   - 或者使用命令生成公钥（如果您有服务器的私钥）：
+创建 `Dockerfile.server`：
+```dockerfile
+FROM golang:1.21-alpine AS builder
 
-   ```bash
-   # Linux/macOS
-   wg pubkey < server_private.key
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
 
-   # Windows (PowerShell)
-   Get-Content server_private.key | wg pubkey
-   ```
+COPY . .
+RUN go build -ldflags="-s -w" -o pekserver ./server
 
-   - 从服务器配置文件中获取（如果有）：
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates iptables
+WORKDIR /root/
 
-   ```bash
-   cat wg-server.conf
-   ```
+COPY --from=builder /app/pekserver .
+EXPOSE 23456/udp 23457/udp
 
-2. **在客户端中使用**：
+CMD ["./pekserver"]
+```
 
-   ```bash
-   # Windows
-   pekclient.exe -server <服务器IP>:23456 -server-pubkey AbCdEfGhIjKlMnOpQrStUvWxYz1234567890AbCd=
+创建 `Dockerfile.client`：
+```dockerfile
+FROM golang:1.21-alpine AS builder
 
-   # Linux/macOS
-   sudo ./pekclient -server <服务器IP>:23456 -server-pubkey AbCdEfGhIjKlMnOpQrStUvWxYz1234567890AbCd=
-   ```
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
 
-3. **验证连接**：
-   连接建立后，可以使用以下命令验证是否使用了正确的服务器公钥：
+COPY . .
+RUN go build -ldflags="-s -w" -o pekclient ./client
 
-   ```bash
-   # Windows
-   wg show
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates iptables
+WORKDIR /root/
 
-   # Linux/macOS
-   sudo wg show
-   ```
+COPY --from=builder /app/pekclient .
 
-   输出中应该包含服务器的公钥信息。
+CMD ["./pekclient"]
+```
 
-4. **为什么需要手动指定服务器公钥？**
-   - 当服务器禁用自动注册功能时，客户端必须提供服务器公钥
-   - 手动指定公钥可以防止中间人攻击，提高安全性
-   - 在某些特殊网络环境中，自动注册可能不可用
+构建 Docker 镜像：
+```bash
+# 构建服务器镜像
+docker build -f Dockerfile.server -t pekhight-vpn-server .
 
-### 自动注册失败
+# 构建客户端镜像
+docker build -f Dockerfile.client -t pekhight-vpn-client .
 
-- 检查服务器是否启用了自动注册功能 (`-enable-reg`)
-- 检查注册密钥是否一致 (`-reg-secret`)
-- 检查服务器注册服务端口（WireGuard 端口 + 1）是否可达
+# 运行服务器容器
+docker run -d --name vpn-server --cap-add=NET_ADMIN --device /dev/net/tun -p 23456:23456/udp -p 23457:23457/udp pekhight-vpn-server
 
-### 无法路由流量
+# 运行客户端容器
+docker run -it --rm --cap-add=NET_ADMIN --device /dev/net/tun pekhight-vpn-client -server SERVER_IP:23456
+```
 
-- 检查 AllowedIPs 设置
-- 确保服务器开启了 IP 转发功能
-- 检查服务器 NAT 配置是否正确
+### 依赖说明
 
-### IPv6 地址泄露
+#### Go 模块依赖
 
-- 客户端已自动实现连接 VPN 后禁用 IPv6 功能
-- 断开连接后会自动重新启用 IPv6
-- 如果仍然发现 IPv6 地址泄露，可以手动检查网络适配器的 IPv6 设置
+项目主要依赖以下 Go 模块：
+- `golang.zx2c4.com/wireguard/wgctrl` - WireGuard 控制库
+- `github.com/songgao/water` - TUN/TAP 接口库
+- `golang.org/x/sys` - 系统调用库
 
-### 连接和断开时网络波动
+这些依赖会在编译时自动下载，但您也可以手动安装：
+```bash
+go mod tidy
+go mod download
+```
 
-- 最新版本已经优化了网络切换过程，减少了波动
-- 如果仍然出现明显的网络波动，可能是由于系统需要重新配置网络路由
-- 尝试降低 VPN 接口的优先级，可以减少切换时的影响
+#### 系统依赖
 
-### Windows系统显示"Internet无法上网"
+- **Windows**: 需要 `wintun.dll` 驱动文件
+- **Linux**: 需要 `iptables` 和 `iproute2` 工具
+- **macOS**: 需要安装 Xcode 命令行工具
 
-- 这是由于Windows网络连接状态指示器(NCSI)的工作方式导致的
-- 最新版本已经实现了自动修复功能，在VPN连接建立后会自动修复NCSI状态
-- 修复过程包括：
-  1. 确保EnableActiveProbing注册表项设置为1，启用NCSI主动探测
-  2. 触发NCSI重新检测网络连接状态
-  3. 重启网络位置感知(NLA)服务
-- 如果仍然显示"Internet无法上网"，但实际上可以正常访问网站，这只是一个显示问题，不影响实际使用
+### 安装和部署
 
-### 客户端超时清理
+#### 系统服务安装（Linux）
 
-- 服务器会自动清理长时间未响应的客户端
-- 可以使用 `-client-timeout` 参数设置超时时间，默认为 10 分钟
-- 可以使用 `-auto-cleanup=false` 参数禁用自动清理功能
+创建 systemd 服务文件 `/etc/systemd/system/pekvpn-server.service`：
+```ini
+[Unit]
+Description=PekHight VPN Server
+After=network.target
 
-## 完整使用场景
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/pekserver -port 23456 -enable-reg
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启用服务：
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable pekvpn-server
+sudo systemctl start pekvpn-server
+```
+
+#### Windows 服务安装
+
+使用 NSSM (Non-Sucking Service Manager) 将程序安装为 Windows 服务：
+```cmd
+# 下载并安装 NSSM
+nssm install PekVPNServer "C:\path\to\pekserver.exe"
+nssm set PekVPNServer Parameters "-port 23456 -enable-reg"
+nssm start PekVPNServer
+```
+
+## 使用示例
 
 ### 场景一：快速启动服务器和客户端
 
